@@ -11,7 +11,7 @@
  * Plugin Name:       Upgrade Readiness Monitor
  * Plugin URI:        https://github.com/dhanendran/upgrade-readiness-monitor
  * Description:       Know before you upgrade. Captures deprecation notices in real time (even with WP_DEBUG off) and audits your plugins and theme for PHP/WordPress compatibility in the background — with a clear readiness verdict and a WP-CLI command for CI.
- * Version:           1.1.1
+ * Version:           1.2.0
  * Author:            D9 Labs
  * Author URI:        https://d9labs.io
  * License:           GPL-2.0-or-later
@@ -26,7 +26,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	die;
 }
 
-define( 'D9URM_VERSION', '1.1.1' );
+define( 'D9URM_VERSION', '1.2.0' );
 define( 'D9URM_FILE', __FILE__ );
 define( 'D9URM_SLUG', 'upgrade-readiness-monitor' );
 
@@ -390,7 +390,7 @@ class D9_Upgrade_Readiness_Monitor {
 			return;
 		}
 
-		$total = count( get_plugins() );
+		$total = count( self::scan_items() );
 		update_option(
 			D9URM_STATE_OPTION,
 			array(
@@ -439,13 +439,16 @@ class D9_Upgrade_Readiness_Monitor {
 			return;
 		}
 
-		$all    = get_plugins();
-		$files  = array_keys( $all );
-		$offset = (int) $state['offset'];
-		$slice  = array_slice( $files, $offset, D9URM_SCAN_CHUNK );
+		$items   = self::scan_items();
+		$plugins = get_plugins();
+		$offset  = (int) $state['offset'];
+		$slice   = array_slice( $items, $offset, D9URM_SCAN_CHUNK );
 
-		foreach ( $slice as $file ) {
-			$state['rows'][] = self::audit_plugin( $file, $all[ $file ] );
+		foreach ( $slice as $item ) {
+			$row = self::audit_item( $item, $plugins );
+			if ( $row ) {
+				$state['rows'][] = $row;
+			}
 		}
 
 		$offset          += count( $slice );
@@ -577,9 +580,61 @@ class D9_Upgrade_Readiness_Monitor {
 		$slug = ( false !== strpos( $file, '/' ) ) ? dirname( $file ) : basename( $file, '.php' );
 		$org  = self::org_plugin_info( $slug );
 
-		$requires_php = $data['RequiresPHP'] ?? '';
-		$reasons      = array();
-		$status       = 'green';
+		list( $status, $reasons ) = self::evaluate( $org, $data['Version'] ?? '', $data['RequiresPHP'] ?? '' );
+
+		return array(
+			'kind'    => 'plugin',
+			'slug'    => $slug,
+			'name'    => $data['Name'] ?? $slug,
+			'version' => $data['Version'] ?? '',
+			'active'  => is_plugin_active( $file ),
+			'status'  => $status,
+			'reasons' => $reasons,
+		);
+	}
+
+	/**
+	 * Audit the active theme (and its parent, for a child theme).
+	 *
+	 * @since 1.2.0
+	 *
+	 * @param string $stylesheet Theme directory (stylesheet) slug.
+	 * @return array|null
+	 */
+	public static function audit_theme( $stylesheet ) {
+		$theme = wp_get_theme( $stylesheet );
+		if ( ! $theme->exists() ) {
+			return null;
+		}
+
+		$org = self::org_theme_info( $stylesheet );
+
+		list( $status, $reasons ) = self::evaluate( $org, (string) $theme->get( 'Version' ), (string) $theme->get( 'RequiresPHP' ) );
+
+		return array(
+			'kind'    => 'theme',
+			'slug'    => $stylesheet,
+			'name'    => $theme->get( 'Name' ) ? $theme->get( 'Name' ) : $stylesheet,
+			'version' => (string) $theme->get( 'Version' ),
+			'active'  => ( get_stylesheet() === $stylesheet || get_template() === $stylesheet ),
+			'status'  => $status,
+			'reasons' => $reasons,
+		);
+	}
+
+	/**
+	 * Shared status evaluation for a plugin or theme.
+	 *
+	 * @since 1.2.0
+	 *
+	 * @param array|null $org              WordPress.org info, or null if not found.
+	 * @param string     $installed_version Installed version.
+	 * @param string     $requires_php      Declared PHP requirement.
+	 * @return array [ status, reasons ]
+	 */
+	private static function evaluate( $org, $installed_version, $requires_php ) {
+		$reasons = array();
+		$status  = 'green';
 
 		if ( $requires_php && version_compare( $requires_php, D9URM_TARGET_PHP, '>' ) ) {
 			$status    = 'red';
@@ -590,26 +645,22 @@ class D9_Upgrade_Readiness_Monitor {
 			$status    = ( 'red' === $status ) ? 'red' : 'amber';
 			$reasons[] = __( 'Not on WordPress.org — cannot verify; test manually.', 'upgrade-readiness-monitor' );
 		} else {
-			$last_updated = $org['last_updated'];
-			$tested       = $org['tested'];
-			$latest       = $org['version'];
-
-			if ( $last_updated ) {
-				$ts = strtotime( $last_updated );
+			if ( ! empty( $org['last_updated'] ) ) {
+				$ts = strtotime( $org['last_updated'] );
 				if ( $ts && $ts < strtotime( '-2 years' ) ) {
 					$status    = 'red';
 					$reasons[] = sprintf( /* translators: %s: date */ __( 'No update since %s (likely abandoned)', 'upgrade-readiness-monitor' ), gmdate( 'Y-m-d', $ts ) );
 				}
 			}
-			if ( $tested && version_compare( $tested, self::wp_major(), '<' ) ) {
+			if ( ! empty( $org['tested'] ) && version_compare( $org['tested'], self::wp_major(), '<' ) ) {
 				$status    = ( 'red' === $status ) ? 'red' : 'amber';
-				$reasons[] = sprintf( /* translators: %s: WP version */ __( 'Tested only up to WordPress %s', 'upgrade-readiness-monitor' ), $tested );
+				$reasons[] = sprintf( /* translators: %s: WP version */ __( 'Tested only up to WordPress %s', 'upgrade-readiness-monitor' ), $org['tested'] );
 			}
-			if ( $latest && version_compare( $latest, (string) ( $data['Version'] ?? '0' ), '>' ) ) {
+			if ( ! empty( $org['version'] ) && version_compare( $org['version'], $installed_version ? $installed_version : '0', '>' ) ) {
 				if ( 'green' === $status ) {
 					$status = 'amber';
 				}
-				$reasons[] = sprintf( /* translators: %s: version */ __( 'Update available (%s)', 'upgrade-readiness-monitor' ), $latest );
+				$reasons[] = sprintf( /* translators: %s: version */ __( 'Update available (%s)', 'upgrade-readiness-monitor' ), $org['version'] );
 			}
 		}
 
@@ -617,14 +668,134 @@ class D9_Upgrade_Readiness_Monitor {
 			$reasons[] = __( 'No issues detected.', 'upgrade-readiness-monitor' );
 		}
 
-		return array(
-			'slug'    => $slug,
-			'name'    => $data['Name'] ?? $slug,
-			'version' => $data['Version'] ?? '',
-			'active'  => is_plugin_active( $file ),
-			'status'  => $status,
-			'reasons' => $reasons,
+		return array( $status, $reasons );
+	}
+
+	/**
+	 * Fetch (and cache) minimal wordpress.org metadata for a theme slug.
+	 *
+	 * @since 1.2.0
+	 *
+	 * @param string $slug Theme slug.
+	 * @return array|null
+	 */
+	private static function org_theme_info( $slug ) {
+		$slug = sanitize_key( $slug );
+		if ( '' === $slug ) {
+			return null;
+		}
+
+		$cache_key = 'd9urm_orgtheme_' . md5( $slug );
+		$cached    = get_transient( $cache_key );
+		if ( false !== $cached ) {
+			return is_array( $cached ) ? $cached : null;
+		}
+
+		if ( ! function_exists( 'themes_api' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/theme.php';
+		}
+
+		$response = themes_api(
+			'theme_information',
+			array(
+				'slug'   => $slug,
+				'fields' => array(
+					'last_updated' => true,
+					'requires'     => true,
+					'requires_php' => true,
+					'version'      => true,
+					'sections'     => false,
+					'description'  => false,
+					'screenshots'  => false,
+					'screenshot_url' => false,
+					'ratings'      => false,
+					'rating'       => false,
+					'downloaded'   => false,
+					'tags'         => false,
+					'versions'     => false,
+				),
+			)
 		);
+
+		$info = null;
+		if ( ! is_wp_error( $response ) && is_object( $response ) ) {
+			$info = array(
+				'last_updated' => isset( $response->last_updated ) ? $response->last_updated : '',
+				'tested'       => isset( $response->tested ) ? $response->tested : '',
+				'requires_php' => isset( $response->requires_php ) ? $response->requires_php : '',
+				'version'      => isset( $response->version ) ? $response->version : '',
+			);
+		}
+
+		set_transient( $cache_key, null === $info ? 'none' : $info, ( null === $info ? 6 : 12 ) * HOUR_IN_SECONDS );
+
+		return $info;
+	}
+
+	/**
+	 * Build the ordered list of items to audit (plugins + active/parent theme).
+	 *
+	 * @since 1.2.0
+	 *
+	 * @return array[] Each: { kind: plugin|theme, id }
+	 */
+	public static function scan_items() {
+		if ( ! function_exists( 'get_plugins' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/plugin.php';
+		}
+
+		$items = array();
+		foreach ( array_keys( get_plugins() ) as $file ) {
+			$items[] = array(
+				'kind' => 'plugin',
+				'id'   => $file,
+			);
+		}
+
+		$theme = wp_get_theme();
+		if ( $theme->exists() ) {
+			$items[] = array(
+				'kind' => 'theme',
+				'id'   => $theme->get_stylesheet(),
+			);
+			$parent = $theme->parent();
+			if ( $parent && $parent->exists() ) {
+				$items[] = array(
+					'kind' => 'theme',
+					'id'   => $parent->get_stylesheet(),
+				);
+			}
+		}
+
+		return $items;
+	}
+
+	/**
+	 * Audit a single scan item (plugin or theme).
+	 *
+	 * @since 1.2.0
+	 *
+	 * @param array      $item    { kind, id }
+	 * @param array|null $plugins Optional get_plugins() map (avoids re-reading).
+	 * @return array|null
+	 */
+	public static function audit_item( $item, $plugins = null ) {
+		if ( 'theme' === $item['kind'] ) {
+			return self::audit_theme( $item['id'] );
+		}
+
+		if ( null === $plugins ) {
+			if ( ! function_exists( 'get_plugins' ) ) {
+				require_once ABSPATH . 'wp-admin/includes/plugin.php';
+			}
+			$plugins = get_plugins();
+		}
+
+		if ( ! isset( $plugins[ $item['id'] ] ) ) {
+			return null;
+		}
+
+		return self::audit_plugin( $item['id'], $plugins[ $item['id'] ] );
 	}
 
 	/**
@@ -651,10 +822,13 @@ class D9_Upgrade_Readiness_Monitor {
 		if ( ! function_exists( 'get_plugins' ) ) {
 			require_once ABSPATH . 'wp-admin/includes/plugin.php';
 		}
-		$all  = get_plugins();
-		$rows = array();
-		foreach ( $all as $file => $data ) {
-			$rows[] = self::audit_plugin( $file, $data );
+		$plugins = get_plugins();
+		$rows    = array();
+		foreach ( self::scan_items() as $item ) {
+			$row = self::audit_item( $item, $plugins );
+			if ( $row ) {
+				$rows[] = $row;
+			}
 		}
 		return $rows;
 	}
@@ -786,19 +960,27 @@ class D9_Upgrade_Readiness_Monitor {
 			return;
 		}
 
+		$state = get_option( D9URM_STATE_OPTION, array() );
+
 		wp_enqueue_script( 'jquery' );
 		wp_localize_script(
 			'jquery',
 			'd9urmData',
 			array(
-				'ajaxUrl' => admin_url( 'admin-ajax.php' ),
-				'nonce'   => wp_create_nonce( 'd9urm' ),
-				'i18n'    => array(
-					'scanning' => esc_html__( 'Scanning in the background…', 'upgrade-readiness-monitor' ),
-					'scan'     => esc_html__( 'Scan plugins now', 'upgrade-readiness-monitor' ),
-					'error'    => esc_html__( 'Could not start the scan. Please try again.', 'upgrade-readiness-monitor' ),
-					'confirm'  => esc_html__( 'Clear all captured deprecation notices?', 'upgrade-readiness-monitor' ),
-					'done'     => esc_html__( 'Scan complete.', 'upgrade-readiness-monitor' ),
+				'ajaxUrl'     => admin_url( 'admin-ajax.php' ),
+				'nonce'       => wp_create_nonce( 'd9urm' ),
+				'scanRunning' => ! empty( $state['running'] ),
+				'types'       => array(
+					'plugin' => esc_html__( 'Plugin', 'upgrade-readiness-monitor' ),
+					'theme'  => esc_html__( 'Theme', 'upgrade-readiness-monitor' ),
+				),
+				'i18n'        => array(
+					'scanning'   => esc_html__( 'Scanning in the background…', 'upgrade-readiness-monitor' ),
+					'safeToLeave' => esc_html__( 'you can safely leave or reload this page.', 'upgrade-readiness-monitor' ),
+					'scan'       => esc_html__( 'Scan now', 'upgrade-readiness-monitor' ),
+					'error'      => esc_html__( 'Could not start the scan. Please try again.', 'upgrade-readiness-monitor' ),
+					'confirm'    => esc_html__( 'Clear all captured deprecation notices?', 'upgrade-readiness-monitor' ),
+					'done'       => esc_html__( 'Scan complete.', 'upgrade-readiness-monitor' ),
 				),
 			)
 		);
@@ -855,11 +1037,12 @@ class D9_Upgrade_Readiness_Monitor {
 				</tbody>
 			</table>
 
-			<h2 style="margin-top:2em;"><?php esc_html_e( 'Plugin compatibility', 'upgrade-readiness-monitor' ); ?></h2>
+			<h2 style="margin-top:2em;"><?php esc_html_e( 'Plugin & theme compatibility', 'upgrade-readiness-monitor' ); ?></h2>
 			<p>
-				<button type="button" class="button button-primary" id="d9urm-scan"><?php esc_html_e( 'Scan plugins now', 'upgrade-readiness-monitor' ); ?></button>
+				<button type="button" class="button button-primary" id="d9urm-scan"><?php esc_html_e( 'Scan now', 'upgrade-readiness-monitor' ); ?></button>
 				<span id="d9urm-scan-status" style="margin-left:10px;"></span>
 			</p>
+			<p class="description"><?php esc_html_e( 'The scan runs in the background and includes your active theme. You can safely leave or reload this page while it runs.', 'upgrade-readiness-monitor' ); ?></p>
 			<?php if ( ! empty( $results['completed_at'] ) ) : ?>
 				<p class="description" id="d9urm-last-scan">
 					<?php
@@ -872,16 +1055,25 @@ class D9_Upgrade_Readiness_Monitor {
 			<table class="widefat striped" id="d9urm-scan-table" style="<?php echo empty( $results['rows'] ) ? 'display:none;' : ''; ?>">
 				<thead>
 					<tr>
-						<th><?php esc_html_e( 'Plugin', 'upgrade-readiness-monitor' ); ?></th>
+						<th><?php esc_html_e( 'Item', 'upgrade-readiness-monitor' ); ?></th>
+						<th><?php esc_html_e( 'Type', 'upgrade-readiness-monitor' ); ?></th>
 						<th><?php esc_html_e( 'Version', 'upgrade-readiness-monitor' ); ?></th>
 						<th><?php esc_html_e( 'Status', 'upgrade-readiness-monitor' ); ?></th>
 						<th><?php esc_html_e( 'Notes', 'upgrade-readiness-monitor' ); ?></th>
 					</tr>
 				</thead>
 				<tbody>
-					<?php foreach ( ( $results['rows'] ?? array() ) as $row ) : ?>
+					<?php
+					$type_labels = array(
+						'plugin' => __( 'Plugin', 'upgrade-readiness-monitor' ),
+						'theme'  => __( 'Theme', 'upgrade-readiness-monitor' ),
+					);
+					foreach ( ( $results['rows'] ?? array() ) as $row ) :
+						$kind = $row['kind'] ?? 'plugin';
+						?>
 						<tr>
 							<td><?php echo esc_html( $row['name'] ); ?><?php echo $row['active'] ? '' : ' <em>(' . esc_html__( 'inactive', 'upgrade-readiness-monitor' ) . ')</em>'; ?></td>
+							<td><?php echo esc_html( $type_labels[ $kind ] ?? $kind ); ?></td>
 							<td><?php echo esc_html( $row['version'] ); ?></td>
 							<td><span class="d9urm-pill d9urm-<?php echo esc_attr( $row['status'] ); ?>"><?php echo esc_html( strtoupper( $row['status'] ) ); ?></span></td>
 							<td><?php echo esc_html( implode( ' · ', $row['reasons'] ) ); ?></td>
@@ -954,9 +1146,11 @@ class D9_Upgrade_Readiness_Monitor {
 	function renderRows( rows ) {
 		var $body = $( '#d9urm-scan-table tbody' );
 		$body.empty();
+		var types = d.types || {};
 		( rows || [] ).forEach( function ( row ) {
 			$body.append(
 				'<tr><td>' + esc( row.name ) + ( row.active ? '' : ' <em>(inactive)</em>' ) + '</td>' +
+				'<td>' + esc( types[ row.kind ] || row.kind ) + '</td>' +
 				'<td>' + esc( row.version ) + '</td>' +
 				'<td>' + pill( row.status ) + '</td>' +
 				'<td>' + esc( ( row.reasons || [] ).join( ' · ' ) ) + '</td></tr>'
@@ -976,7 +1170,7 @@ class D9_Upgrade_Readiness_Monitor {
 				var results = resp.data.results || {};
 				if ( state.running ) {
 					var pct = state.total ? Math.round( ( state.offset || 0 ) / state.total * 100 ) : 0;
-					setStatus( i18n.scanning + ' ' + pct + '%' );
+					setStatus( i18n.scanning + ' ' + pct + '% — ' + i18n.safeToLeave );
 				} else {
 					clearInterval( poll ); poll = null;
 					setStatus( i18n.done );
@@ -1008,6 +1202,14 @@ class D9_Upgrade_Readiness_Monitor {
 	$( function () {
 		$( '#d9urm-scan' ).on( 'click', scan );
 		$( document ).on( 'click', '#d9urm-clear', clearLog );
+
+		// If a scan is already running (e.g. the page was reloaded mid-scan),
+		// reattach to it and resume showing progress.
+		if ( d.scanRunning ) {
+			$( '#d9urm-scan' ).prop( 'disabled', true );
+			setStatus( i18n.scanning + ' — ' + i18n.safeToLeave );
+			startPolling();
+		}
 	} );
 } )( jQuery );
 JS;
@@ -1029,7 +1231,7 @@ JS;
 		delete_option( D9URM_STATE_OPTION );
 		wp_clear_scheduled_hook( 'd9urm_weekly_scan' );
 		wp_clear_scheduled_hook( 'd9urm_run_scan_chunk' );
-		$wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient_d9urm_org_%' OR option_name LIKE '_transient_timeout_d9urm_org_%'" ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+		$wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient_d9urm_org%' OR option_name LIKE '_transient_timeout_d9urm_org%'" ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
 	}
 }
 
