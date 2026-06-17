@@ -11,7 +11,7 @@
  * Plugin Name:       Upgrade Readiness Monitor
  * Plugin URI:        https://github.com/dhanendran/upgrade-readiness-monitor
  * Description:       Know before you upgrade. Captures deprecation notices in real time (even with WP_DEBUG off) and audits your plugins and theme for PHP/WordPress compatibility in the background — with a clear readiness verdict and a WP-CLI command for CI.
- * Version:           1.5.0
+ * Version:           1.6.0
  * Author:            D9 Labs
  * Author URI:        https://d9labs.io
  * License:           GPL-2.0-or-later
@@ -26,7 +26,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	die;
 }
 
-define( 'D9URM_VERSION', '1.5.0' );
+define( 'D9URM_VERSION', '1.6.0' );
 define( 'D9URM_FILE', __FILE__ );
 define( 'D9URM_SLUG', 'upgrade-readiness-monitor' );
 
@@ -108,6 +108,7 @@ class D9_Upgrade_Readiness_Monitor {
 
 		// AJAX (lightweight: start a background scan, poll status, clear log).
 		add_action( 'wp_ajax_d9urm_start_scan', array( $this, 'ajax_start_scan' ) );
+		add_action( 'wp_ajax_d9urm_scan_step', array( $this, 'ajax_scan_step' ) );
 		add_action( 'wp_ajax_d9urm_scan_status', array( $this, 'ajax_scan_status' ) );
 		add_action( 'wp_ajax_d9urm_clear', array( $this, 'ajax_clear' ) );
 		add_action( 'wp_ajax_d9urm_deprecations', array( $this, 'ajax_deprecations' ) );
@@ -387,16 +388,19 @@ class D9_Upgrade_Readiness_Monitor {
 	 *
 	 * @since 1.1.0
 	 */
-	public function start_scan() {
+	public function start_scan( $force = false ) {
 		if ( ! function_exists( 'get_plugins' ) ) {
 			require_once ABSPATH . 'wp-admin/includes/plugin.php';
 		}
 
 		$state = get_option( D9URM_STATE_OPTION, array() );
-		// Don't stack scans; allow restart if a previous run stalled (>10 min).
-		if ( ! empty( $state['running'] ) && isset( $state['updated'] ) && ( time() - $state['updated'] ) < 600 ) {
+		// Don't stack scans; allow restart if a previous run stalled (>10 min)
+		// or when the caller forces a fresh start (a user clicking "Scan now").
+		if ( ! $force && ! empty( $state['running'] ) && isset( $state['updated'] ) && ( time() - $state['updated'] ) < 600 ) {
 			return;
 		}
+
+		delete_transient( 'd9urm_scan_lock' );
 
 		$total = count( self::scan_items() );
 		update_option(
@@ -430,68 +434,93 @@ class D9_Upgrade_Readiness_Monitor {
 	}
 
 	/**
-	 * Process one small chunk of plugins in the background, then reschedule.
-	 *
-	 * Each chunk runs in its own request and audits only D9URM_SCAN_CHUNK
-	 * plugins, so memory stays low regardless of how many plugins exist.
+	 * WP-Cron entry point: process one chunk, then reschedule if more remain.
+	 * Used for unattended / weekly scans.
 	 *
 	 * @since 1.1.0
 	 */
 	public function run_scan_chunk() {
+		if ( $this->process_chunk() ) {
+			$this->schedule_chunk();
+		}
+	}
+
+	/**
+	 * Process one bounded chunk of work. Safe to call from either WP-Cron or
+	 * an AJAX poll — a short lock prevents two workers colliding.
+	 *
+	 * Each call audits only D9URM_SCAN_CHUNK items, so memory stays low
+	 * regardless of how many plugins/themes exist.
+	 *
+	 * @since 1.6.0
+	 *
+	 * @return bool True if the scan is still running (more chunks to do).
+	 */
+	public function process_chunk() {
 		if ( ! function_exists( 'get_plugins' ) ) {
 			require_once ABSPATH . 'wp-admin/includes/plugin.php';
 		}
 
 		$state = get_option( D9URM_STATE_OPTION, array() );
 		if ( empty( $state['running'] ) ) {
-			return;
+			return false;
 		}
 
-		$items   = self::scan_items();
-		$plugins = get_plugins();
-		$offset  = (int) $state['offset'];
-		$slice   = array_slice( $items, $offset, D9URM_SCAN_CHUNK );
+		// Only one worker processes at a time.
+		if ( get_transient( 'd9urm_scan_lock' ) ) {
+			return true; // Busy elsewhere; still running.
+		}
+		set_transient( 'd9urm_scan_lock', 1, 2 * MINUTE_IN_SECONDS );
 
-		foreach ( $slice as $item ) {
-			$row = self::audit_item( $item, $plugins );
-			if ( $row ) {
-				$state['rows'][] = $row;
+		try {
+			$items   = self::scan_items();
+			$plugins = get_plugins();
+			$offset  = (int) $state['offset'];
+			$slice   = array_slice( $items, $offset, D9URM_SCAN_CHUNK );
+
+			foreach ( $slice as $item ) {
+				$row = self::audit_item( $item, $plugins );
+				if ( $row ) {
+					$state['rows'][] = $row;
+				}
 			}
+
+			$offset          += count( $slice );
+			$state['offset']  = $offset;
+			$state['updated'] = time();
+
+			if ( $offset < $state['total'] && ! empty( $slice ) ) {
+				update_option( D9URM_STATE_OPTION, $state, false );
+				return true;
+			}
+
+			// Finished — store final results, mark idle.
+			$rows = $state['rows'];
+			update_option(
+				D9URM_RESULTS_OPTION,
+				array(
+					'schema'       => D9URM_RESULTS_SCHEMA,
+					'rows'         => $rows,
+					'completed_at' => time(),
+					'environment'  => self::environment(),
+					'verdict'      => self::verdict( $rows, $this->deprecation_count() ),
+				),
+				false
+			);
+			update_option(
+				D9URM_STATE_OPTION,
+				array(
+					'running' => false,
+					'offset'  => $offset,
+					'total'   => $state['total'],
+					'updated' => time(),
+				),
+				false
+			);
+			return false;
+		} finally {
+			delete_transient( 'd9urm_scan_lock' );
 		}
-
-		$offset          += count( $slice );
-		$state['offset']  = $offset;
-		$state['updated'] = time();
-
-		if ( $offset < $state['total'] && ! empty( $slice ) ) {
-			update_option( D9URM_STATE_OPTION, $state, false );
-			$this->schedule_chunk();
-			return;
-		}
-
-		// Finished — store final results, mark idle.
-		$rows = $state['rows'];
-		update_option(
-			D9URM_RESULTS_OPTION,
-			array(
-				'schema'       => D9URM_RESULTS_SCHEMA,
-				'rows'         => $rows,
-				'completed_at' => time(),
-				'environment'  => self::environment(),
-				'verdict'      => self::verdict( $rows, $this->deprecation_count() ),
-			),
-			false
-		);
-		update_option(
-			D9URM_STATE_OPTION,
-			array(
-				'running' => false,
-				'offset'  => $offset,
-				'total'   => $state['total'],
-				'updated' => time(),
-			),
-			false
-		);
 	}
 
 	/**
@@ -1366,8 +1395,28 @@ class D9_Upgrade_Readiness_Monitor {
 		if ( ! current_user_can( 'activate_plugins' ) ) {
 			wp_send_json_error( array( 'message' => __( 'Permission denied.', 'upgrade-readiness-monitor' ) ), 403 );
 		}
-		$this->start_scan();
+		$this->start_scan( true ); // User-initiated: always start fresh.
 		wp_send_json_success( get_option( D9URM_STATE_OPTION, array() ) );
+	}
+
+	/**
+	 * Process one chunk of the scan and return progress. This is what drives
+	 * the scan forward while the report page is open, independent of WP-Cron.
+	 *
+	 * @since 1.6.0
+	 */
+	public function ajax_scan_step() {
+		check_ajax_referer( 'd9urm', 'nonce' );
+		if ( ! current_user_can( 'activate_plugins' ) ) {
+			wp_send_json_error( array( 'message' => __( 'Permission denied.', 'upgrade-readiness-monitor' ) ), 403 );
+		}
+		$this->process_chunk();
+		wp_send_json_success(
+			array(
+				'state'   => get_option( D9URM_STATE_OPTION, array() ),
+				'results' => get_option( D9URM_RESULTS_OPTION, array() ),
+			)
+		);
 	}
 
 	/**
@@ -1738,25 +1787,40 @@ class D9_Upgrade_Readiness_Monitor {
 
 	function setStatus( txt ) { $( '#d9urm-scan-status' ).text( txt || '' ); }
 
-	function startPolling() {
-		if ( poll ) { return; }
-		poll = setInterval( function () {
-			$.post( d.ajaxUrl, { action: 'd9urm_scan_status', nonce: d.nonce } ).done( function ( resp ) {
-				if ( ! resp || ! resp.success ) { return; }
-				var state = resp.data.state || {};
-				var results = resp.data.results || {};
-				if ( state.running ) {
-					var pct = state.total ? Math.round( ( state.offset || 0 ) / state.total * 100 ) : 0;
-					setStatus( i18n.scanning + ' ' + pct + '% — ' + i18n.safeToLeave );
-				} else {
-					clearInterval( poll ); poll = null;
-					setStatus( i18n.done );
-					$( '#d9urm-scan' ).prop( 'disabled', false );
-					renderRows( results.rows );
-					refreshDeprecations();
-				}
-			} );
-		}, 2500 );
+	var stepping = false;
+
+	// Drive the scan forward one chunk at a time from the browser, so progress
+	// never depends on WP-Cron firing. The work itself is bounded server-side.
+	function step() {
+		$.post( d.ajaxUrl, { action: 'd9urm_scan_step', nonce: d.nonce } ).done( function ( resp ) {
+			if ( ! resp || ! resp.success ) { setStatus( i18n.error ); finishScan(); return; }
+			var state = resp.data.state || {};
+			var results = resp.data.results || {};
+			if ( state.running ) {
+				var pct = state.total ? Math.round( ( state.offset || 0 ) / state.total * 100 ) : 0;
+				setStatus( i18n.scanning + ' ' + pct + '% — ' + i18n.safeToLeave );
+				setTimeout( step, 400 ); // brief pause; keeps the server gentle
+			} else {
+				setStatus( i18n.done );
+				renderRows( results.rows );
+				refreshDeprecations();
+				finishScan();
+			}
+		} ).fail( function () {
+			setStatus( i18n.error ); finishScan();
+		} );
+	}
+
+	function runScan() {
+		if ( stepping ) { return; }
+		stepping = true;
+		$( '#d9urm-scan' ).prop( 'disabled', true );
+		step();
+	}
+
+	function finishScan() {
+		stepping = false;
+		$( '#d9urm-scan' ).prop( 'disabled', false );
 	}
 
 	function scan() {
@@ -1764,7 +1828,7 @@ class D9_Upgrade_Readiness_Monitor {
 		setStatus( i18n.scanning );
 		$.post( d.ajaxUrl, { action: 'd9urm_start_scan', nonce: d.nonce } ).done( function ( resp ) {
 			if ( ! resp || ! resp.success ) { setStatus( i18n.error ); $( '#d9urm-scan' ).prop( 'disabled', false ); return; }
-			startPolling();
+			runScan();
 		} ).fail( function () {
 			setStatus( i18n.error ); $( '#d9urm-scan' ).prop( 'disabled', false );
 		} );
@@ -1806,11 +1870,10 @@ class D9_Upgrade_Readiness_Monitor {
 		refreshDeprecations();
 
 		// If a scan is already running (e.g. the page was reloaded mid-scan),
-		// reattach to it and resume showing progress.
+		// resume driving it forward.
 		if ( d.scanRunning ) {
-			$( '#d9urm-scan' ).prop( 'disabled', true );
 			setStatus( i18n.scanning + ' — ' + i18n.safeToLeave );
-			startPolling();
+			runScan();
 		}
 	} );
 } )( jQuery );
