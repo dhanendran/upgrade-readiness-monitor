@@ -34,6 +34,16 @@ It works in two complementary ways:
     # Machine-readable output for pipelines
     wp readiness check --format=json
 
+== External services ==
+
+This plugin connects to WordPress.org to assess upgrade readiness. It does not contact any other third-party service and does not send any personal data.
+
+1. **WordPress.org Plugins/Themes API** (api.wordpress.org) — for each installed plugin and theme, its slug is sent to look up the latest version, "tested up to" value, and last-updated date. Used during a scan and the weekly background scan.
+2. **WordPress.org version list** (api.wordpress.org/core/stable-check) — fetches the list of available WordPress versions for the upgrade-target selector.
+3. **WordPress.org core source** (core.svn.wordpress.org) — downloads the target WordPress version's public list of deprecated functions to compare against your code. Only the version number is part of the request.
+
+All three are WordPress.org services, governed by the WordPress.org privacy policy (https://wordpress.org/about/privacy/).
+
 == Installation ==
 
 1. Upload the `upgrade-readiness-monitor` folder to `/wp-content/plugins/`, or install it from the Plugins screen.
