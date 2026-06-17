@@ -4,7 +4,7 @@ Tags: deprecation, php compatibility, upgrade, developer, site health
 Requires at least: 5.4
 Tested up to: 7.0
 Requires PHP: 7.4
-Stable tag: 1.2.0
+Stable tag: 1.2.1
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -54,6 +54,9 @@ No. WordPress fires its deprecation hooks whether or not `WP_DEBUG` is enabled, 
 It catches deprecations that actually run, plus header/registry-based compatibility signals. As with any tool, runtime-only issues still warrant testing on staging — but you'll start every upgrade knowing far more than before.
 
 == Changelog ==
+
+= 1.2.1 =
+* [Fix] The Type column could appear blank for some rows when results predated the 1.2.0 row format. Results are now schema-stamped (stale results trigger a clean re-scan) and a missing type safely falls back to "Plugin".
 
 = 1.2.0 =
 * [Feature] The audit now includes your active theme (and its parent, for child themes), not just plugins. Results show a Type column.

@@ -11,7 +11,7 @@
  * Plugin Name:       Upgrade Readiness Monitor
  * Plugin URI:        https://github.com/dhanendran/upgrade-readiness-monitor
  * Description:       Know before you upgrade. Captures deprecation notices in real time (even with WP_DEBUG off) and audits your plugins and theme for PHP/WordPress compatibility in the background — with a clear readiness verdict and a WP-CLI command for CI.
- * Version:           1.2.0
+ * Version:           1.2.1
  * Author:            D9 Labs
  * Author URI:        https://d9labs.io
  * License:           GPL-2.0-or-later
@@ -26,7 +26,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	die;
 }
 
-define( 'D9URM_VERSION', '1.2.0' );
+define( 'D9URM_VERSION', '1.2.1' );
 define( 'D9URM_FILE', __FILE__ );
 define( 'D9URM_SLUG', 'upgrade-readiness-monitor' );
 
@@ -34,6 +34,7 @@ define( 'D9URM_LOG_OPTION', 'd9urm_deprecation_log' );
 define( 'D9URM_RESULTS_OPTION', 'd9urm_scan_results' );
 define( 'D9URM_STATE_OPTION', 'd9urm_scan_state' );
 
+define( 'D9URM_RESULTS_SCHEMA', 2 );      // Bump when the audit row shape changes (2 = adds "kind").
 define( 'D9URM_LOG_CAP', 300 );          // Max distinct deprecation notices stored.
 define( 'D9URM_CAPTURE_PER_REQUEST', 25 ); // Max new captures per request (perf guard).
 define( 'D9URM_SCAN_CHUNK', 3 );          // Plugins audited per background tick.
@@ -466,6 +467,7 @@ class D9_Upgrade_Readiness_Monitor {
 		update_option(
 			D9URM_RESULTS_OPTION,
 			array(
+				'schema'       => D9URM_RESULTS_SCHEMA,
 				'rows'         => $rows,
 				'completed_at' => time(),
 				'environment'  => self::environment(),
@@ -1003,7 +1005,11 @@ class D9_Upgrade_Readiness_Monitor {
 
 		$env     = self::environment();
 		$results = get_option( D9URM_RESULTS_OPTION, array() );
-		$log     = get_option( D9URM_LOG_OPTION, array() );
+		// Ignore results from an older row schema (e.g. before the Type column),
+		// so an upgrade prompts a clean re-scan instead of showing mixed data.
+		$fresh       = isset( $results['schema'] ) && (int) $results['schema'] >= D9URM_RESULTS_SCHEMA;
+		$result_rows = $fresh ? ( $results['rows'] ?? array() ) : array();
+		$log         = get_option( D9URM_LOG_OPTION, array() );
 		$log     = is_array( $log ) ? $log : array();
 		uasort(
 			$log,
@@ -1043,7 +1049,7 @@ class D9_Upgrade_Readiness_Monitor {
 				<span id="d9urm-scan-status" style="margin-left:10px;"></span>
 			</p>
 			<p class="description"><?php esc_html_e( 'The scan runs in the background and includes your active theme. You can safely leave or reload this page while it runs.', 'upgrade-readiness-monitor' ); ?></p>
-			<?php if ( ! empty( $results['completed_at'] ) ) : ?>
+			<?php if ( $fresh && ! empty( $results['completed_at'] ) ) : ?>
 				<p class="description" id="d9urm-last-scan">
 					<?php
 					/* translators: %s: human time diff */
@@ -1052,7 +1058,7 @@ class D9_Upgrade_Readiness_Monitor {
 				</p>
 			<?php endif; ?>
 
-			<table class="widefat striped" id="d9urm-scan-table" style="<?php echo empty( $results['rows'] ) ? 'display:none;' : ''; ?>">
+			<table class="widefat striped" id="d9urm-scan-table" style="<?php echo empty( $result_rows ) ? 'display:none;' : ''; ?>">
 				<thead>
 					<tr>
 						<th><?php esc_html_e( 'Item', 'upgrade-readiness-monitor' ); ?></th>
@@ -1068,7 +1074,7 @@ class D9_Upgrade_Readiness_Monitor {
 						'plugin' => __( 'Plugin', 'upgrade-readiness-monitor' ),
 						'theme'  => __( 'Theme', 'upgrade-readiness-monitor' ),
 					);
-					foreach ( ( $results['rows'] ?? array() ) as $row ) :
+					foreach ( $result_rows as $row ) :
 						$kind = $row['kind'] ?? 'plugin';
 						?>
 						<tr>
@@ -1148,9 +1154,11 @@ class D9_Upgrade_Readiness_Monitor {
 		$body.empty();
 		var types = d.types || {};
 		( rows || [] ).forEach( function ( row ) {
+			// A missing kind means an old-schema row, which was always a plugin.
+			var typeLabel = row.kind ? ( types[ row.kind ] || row.kind ) : ( types.plugin || 'Plugin' );
 			$body.append(
 				'<tr><td>' + esc( row.name ) + ( row.active ? '' : ' <em>(inactive)</em>' ) + '</td>' +
-				'<td>' + esc( types[ row.kind ] || row.kind ) + '</td>' +
+				'<td>' + esc( typeLabel ) + '</td>' +
 				'<td>' + esc( row.version ) + '</td>' +
 				'<td>' + pill( row.status ) + '</td>' +
 				'<td>' + esc( ( row.reasons || [] ).join( ' · ' ) ) + '</td></tr>'
