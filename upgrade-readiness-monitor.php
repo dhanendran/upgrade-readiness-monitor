@@ -11,7 +11,7 @@
  * Plugin Name:       Upgrade Readiness Monitor
  * Plugin URI:        https://github.com/dhanendran/upgrade-readiness-monitor
  * Description:       Know before you upgrade. Captures deprecation notices in real time (even with WP_DEBUG off) and audits your plugins and theme for PHP/WordPress compatibility in the background — with a clear readiness verdict and a WP-CLI command for CI.
- * Version:           1.1.0
+ * Version:           1.1.1
  * Author:            D9 Labs
  * Author URI:        https://d9labs.io
  * License:           GPL-2.0-or-later
@@ -26,7 +26,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	die;
 }
 
-define( 'D9URM_VERSION', '1.1.0' );
+define( 'D9URM_VERSION', '1.1.1' );
 define( 'D9URM_FILE', __FILE__ );
 define( 'D9URM_SLUG', 'upgrade-readiness-monitor' );
 
@@ -63,6 +63,14 @@ class D9_Upgrade_Readiness_Monitor {
 	 * @var int
 	 */
 	private $capture_count = 0;
+
+	/**
+	 * Re-entrancy guard so our own handler can never recurse into itself
+	 * (e.g. if a call inside it triggers another deprecation/doing_it_wrong).
+	 *
+	 * @var bool
+	 */
+	private $recording = false;
 
 	/**
 	 * Boot the plugin.
@@ -216,31 +224,39 @@ class D9_Upgrade_Readiness_Monitor {
 	 * @param string $version Version.
 	 */
 	private function record( $type, $label, $message, $version ) {
-		// Per-request perf guard: stop after a cap so a deprecated call inside
-		// a big loop can never spiral CPU/memory.
-		if ( $this->capture_count >= D9URM_CAPTURE_PER_REQUEST ) {
+		// Re-entrancy guard + per-request cap. The guard is critical: nothing in
+		// this method may call a function that could itself trigger another
+		// deprecation/doing_it_wrong notice (which would re-enter this handler
+		// and recurse). We also keep this path translation-free for the same
+		// reason — values are stored raw and translated at display time.
+		if ( $this->recording || $this->capture_count >= D9URM_CAPTURE_PER_REQUEST ) {
 			return;
 		}
 
-		$source = $this->guess_source();
-		$key    = md5( $type . '|' . $label . '|' . $version . '|' . $source['slug'] );
+		$this->recording = true;
+		try {
+			$source = $this->guess_source();
+			$key    = md5( $type . '|' . $label . '|' . $version . '|' . $source['slug'] );
 
-		if ( isset( $this->captured[ $key ] ) ) {
-			$this->captured[ $key ]['count']++;
-			return;
+			if ( isset( $this->captured[ $key ] ) ) {
+				$this->captured[ $key ]['count']++;
+				return;
+			}
+
+			$this->capture_count++;
+			$this->captured[ $key ] = array(
+				'type'        => $type,
+				'label'       => (string) $label,
+				'message'     => (string) $message,
+				'version'     => (string) $version,
+				'source_slug' => $source['slug'],
+				'source_name' => $source['name'],
+				'source_type' => $source['type'],
+				'count'       => 1,
+			);
+		} finally {
+			$this->recording = false;
 		}
-
-		$this->capture_count++;
-		$this->captured[ $key ] = array(
-			'type'        => $type,
-			'label'       => (string) $label,
-			'message'     => (string) $message,
-			'version'     => (string) $version,
-			'source_slug' => $source['slug'],
-			'source_name' => $source['name'],
-			'source_type' => $source['type'],
-			'count'       => 1,
-		);
 	}
 
 	/**
@@ -251,9 +267,10 @@ class D9_Upgrade_Readiness_Monitor {
 	 * @return array { slug, name, type }
 	 */
 	private function guess_source() {
+		// Raw values only — no translation calls in the capture hot path.
 		$unknown = array(
 			'slug' => 'unknown',
-			'name' => __( 'Unknown / core', 'upgrade-readiness-monitor' ),
+			'name' => '',
 			'type' => 'unknown',
 		);
 
@@ -891,7 +908,13 @@ class D9_Upgrade_Readiness_Monitor {
 					<tbody>
 						<?php foreach ( $log as $entry ) : ?>
 							<tr>
-								<td><?php echo esc_html( $entry['source_name'] ); ?> <code><?php echo esc_html( $entry['source_type'] ); ?></code></td>
+								<td>
+									<?php
+									$source_name = '' !== $entry['source_name'] ? $entry['source_name'] : __( 'Unknown / core', 'upgrade-readiness-monitor' );
+									echo esc_html( $source_name );
+									?>
+									<code><?php echo esc_html( $entry['source_type'] ); ?></code>
+								</td>
 								<td><?php echo esc_html( $entry['type'] ); ?></td>
 								<td>
 									<code><?php echo esc_html( $entry['label'] ); ?></code>

@@ -4,7 +4,7 @@ Tags: deprecation, php compatibility, upgrade, developer, site health
 Requires at least: 5.4
 Tested up to: 7.0
 Requires PHP: 7.4
-Stable tag: 1.1.0
+Stable tag: 1.1.1
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -54,6 +54,9 @@ No. WordPress fires its deprecation hooks whether or not `WP_DEBUG` is enabled, 
 It catches deprecations that actually run, plus header/registry-based compatibility signals. As with any tool, runtime-only issues still warrant testing on staging — but you'll start every upgrade knowing far more than before.
 
 == Changelog ==
+
+= 1.1.1 =
+* [Fix] Fixed a fatal memory-exhaustion error on sites that emit many deprecation notices. The capture handler no longer calls translation functions (which could trigger a "translation loaded too early" notice and recurse into the handler), and a re-entrancy guard now makes recursion impossible.
 
 = 1.1.0 =
 * [Fix] Resolved a memory-exhaustion risk: the plugin audit now requests only the minimal fields from WordPress.org (no full changelog/sections payloads) via `plugins_api()`.
