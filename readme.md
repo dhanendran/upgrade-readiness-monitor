@@ -4,7 +4,7 @@ Tags: deprecation, php compatibility, upgrade, developer, site health
 Requires at least: 5.4
 Tested up to: 7.0
 Requires PHP: 7.4
-Stable tag: 1.4.0
+Stable tag: 1.5.0
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -18,7 +18,7 @@ It works in two complementary ways:
 
 * **Real-time deprecation capture.** The plugin listens for WordPress's deprecation signals (`deprecated_function_run`, `deprecated_hook_run`, `doing_it_wrong_run`, and friends) as your site runs. Because those signals fire *regardless of `WP_DEBUG`*, you catch real deprecations on production without turning on debug mode — each one attributed to the plugin or theme that triggered it.
 * **Plugin & theme audit.** A one-click scan checks every installed plugin and your active theme against WordPress.org for abandoned code (no update in 2+ years), "tested up to" lag, available updates, and declared PHP requirements — and rolls everything into a single **green / amber / red** readiness verdict.
-* **Local scan for custom & premium code.** Plugins and themes that aren't on WordPress.org (custom builds, premium products) can't be checked against the directory — so they're scanned **locally** instead: their PHP is parsed for usage of deprecated WordPress functions (matched against your WordPress version's own deprecation list) and functions removed in recent PHP. This catches the very code most likely to break on an upgrade.
+* **Static code scan against your chosen target.** Every plugin and theme — including custom and premium code that isn't on WordPress.org — has its PHP parsed and checked against the WordPress and PHP versions you plan to upgrade **to**. Findings are graded: **Error** (will break — e.g. a function removed in the target PHP version) or **Warning** (a deprecation notice you'll start seeing). The list of functions the target WordPress version deprecates is fetched from WordPress core itself, so it reflects the actual upgrade, not your current version.
 
 = Built for developers and agencies =
 
@@ -54,11 +54,22 @@ No. WordPress fires its deprecation hooks whether or not `WP_DEBUG` is enabled, 
 
 It catches deprecations that actually run, plus header/registry-based compatibility signals. As with any tool, runtime-only issues still warrant testing on staging — but you'll start every upgrade knowing far more than before.
 
-= Does the local code scan know about a higher WordPress version's deprecations? =
+= How accurate are the Error / Warning findings? =
 
-The local scan's list of deprecated WordPress functions is built from the WordPress version currently installed, so it reflects "deprecated as of your current version." The version targets you select drive the metadata checks ("tested up to", PHP requirement). To surface deprecations introduced by a newer WordPress release specifically, run the tool on a staging copy after upgrading.
+"Error" findings are conservative and high-confidence: they come from a hand-verified list of PHP functions that are genuinely **removed** in the target PHP version (calling them is a fatal error). "Warning" findings are deprecations — code that still works but emits a notice on the target. The WordPress deprecation list for your target version is fetched from WordPress core itself.
+
+The scan is precise rather than exhaustive: it reports problems it is confident about and never invents findings. It does not execute your code, so a clean result is not an absolute guarantee — always do a final test on staging — but a red verdict means there is real, specific breakage to fix first.
+
+= What if the target version data can't be fetched? =
+
+If WordPress.org can't be reached, the target-version deprecation check is simply skipped (you'll still get the PHP checks, metadata signals, and runtime capture). The tool never fabricates results from missing data.
 
 == Changelog ==
+
+= 1.5.0 =
+* [Feature] Code is now scanned **against the version you're upgrading to** and findings are graded **Error** (will break) vs **Warning** (deprecation). Errors come from a hand-verified list of functions removed in the target PHP version; warnings include functions the target WordPress version deprecates (fetched from WordPress core).
+* [Improvement] The static code scan now runs for **all** plugins and themes, not only custom/premium ones — so a removed-PHP-function call is caught wherever it lives.
+* [Improvement] WordPress deprecation warnings are limited to functions *newly* deprecated by the target version, keeping the report high-signal.
 
 = 1.4.0 =
 * [Feature] Pick the version you're upgrading **to**. WordPress and PHP target selectors let you choose the version to test compatibility against; changing a target saves it and re-runs the audit. The WordPress list is fetched from WordPress.org (versions at or above your current one).

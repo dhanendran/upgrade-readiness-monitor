@@ -11,7 +11,7 @@
  * Plugin Name:       Upgrade Readiness Monitor
  * Plugin URI:        https://github.com/dhanendran/upgrade-readiness-monitor
  * Description:       Know before you upgrade. Captures deprecation notices in real time (even with WP_DEBUG off) and audits your plugins and theme for PHP/WordPress compatibility in the background — with a clear readiness verdict and a WP-CLI command for CI.
- * Version:           1.4.0
+ * Version:           1.5.0
  * Author:            D9 Labs
  * Author URI:        https://d9labs.io
  * License:           GPL-2.0-or-later
@@ -26,7 +26,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	die;
 }
 
-define( 'D9URM_VERSION', '1.4.0' );
+define( 'D9URM_VERSION', '1.5.0' );
 define( 'D9URM_FILE', __FILE__ );
 define( 'D9URM_SLUG', 'upgrade-readiness-monitor' );
 
@@ -37,7 +37,7 @@ define( 'D9URM_STATE_OPTION', 'd9urm_scan_state' );
 define( 'D9URM_RESULTS_SCHEMA', 2 );      // Bump when the audit row shape changes (2 = adds "kind").
 define( 'D9URM_LOG_CAP', 300 );          // Max distinct deprecation notices stored.
 define( 'D9URM_CAPTURE_PER_REQUEST', 25 ); // Max new captures per request (perf guard).
-define( 'D9URM_SCAN_CHUNK', 3 );          // Plugins audited per background tick.
+define( 'D9URM_SCAN_CHUNK', 2 );          // Items audited per background tick (each now includes a code scan).
 define( 'D9URM_SCAN_MAX_FILES', 800 );    // Max PHP files statically scanned per non-.org item.
 define( 'D9URM_SCAN_MAX_FILESIZE', 524288 ); // Skip files larger than 512KB (likely minified/vendor).
 
@@ -648,55 +648,71 @@ class D9_Upgrade_Readiness_Monitor {
 		$reasons = array();
 		$status  = 'green';
 
+		// 1) Plugin/theme declares a minimum PHP higher than the target (won't run).
 		if ( $requires_php && version_compare( $requires_php, self::php_target(), '>' ) ) {
 			$status    = 'red';
-			$reasons[] = sprintf( /* translators: %s: PHP version */ __( 'Requires PHP %s', 'upgrade-readiness-monitor' ), $requires_php );
+			$reasons[] = sprintf(
+				/* translators: 1: required PHP, 2: target PHP */
+				__( 'Error: requires PHP %1$s, above your target of %2$s', 'upgrade-readiness-monitor' ),
+				$requires_php,
+				self::php_target()
+			);
 		}
 
-		if ( null === $org ) {
-			// Not on WordPress.org (custom/premium): scan the actual code locally.
-			if ( $dir ) {
-				$scan = self::static_scan( $dir );
-				if ( ! empty( $scan['wp'] ) ) {
-					$status    = ( 'red' === $status ) ? 'red' : 'amber';
-					$reasons[] = sprintf( /* translators: %s: function list */ __( 'Local scan: uses deprecated WordPress function(s): %s', 'upgrade-readiness-monitor' ), implode( ', ', array_slice( $scan['wp'], 0, 12 ) ) );
-				}
-				if ( ! empty( $scan['php'] ) ) {
-					$status    = ( 'red' === $status ) ? 'red' : 'amber';
-					$reasons[] = sprintf( /* translators: %s: function list */ __( 'Local scan: uses function(s) removed/deprecated in PHP: %s', 'upgrade-readiness-monitor' ), implode( ', ', array_slice( $scan['php'], 0, 12 ) ) );
-				}
-				if ( empty( $scan['wp'] ) && empty( $scan['php'] ) ) {
-					$reasons[] = __( 'Not on WordPress.org; local code scan found no deprecated function usage.', 'upgrade-readiness-monitor' );
-				}
-				if ( ! empty( $scan['truncated'] ) ) {
-					$reasons[] = __( '(Local scan was partial — large codebase.)', 'upgrade-readiness-monitor' );
-				}
-			} else {
-				$status    = ( 'red' === $status ) ? 'red' : 'amber';
-				$reasons[] = __( 'Not on WordPress.org — cannot verify; test manually.', 'upgrade-readiness-monitor' );
-			}
-		} else {
+		// 2) WordPress.org metadata signals (hosted items only).
+		if ( null !== $org ) {
 			if ( ! empty( $org['last_updated'] ) ) {
 				$ts = strtotime( $org['last_updated'] );
 				if ( $ts && $ts < strtotime( '-2 years' ) ) {
-					$status    = 'red';
-					$reasons[] = sprintf( /* translators: %s: date */ __( 'No update since %s (likely abandoned)', 'upgrade-readiness-monitor' ), gmdate( 'Y-m-d', $ts ) );
+					if ( 'red' !== $status ) {
+						$status = 'amber';
+					}
+					$reasons[] = sprintf( /* translators: %s: date */ __( 'Warning: no update since %s (possibly abandoned)', 'upgrade-readiness-monitor' ), gmdate( 'Y-m-d', $ts ) );
 				}
 			}
 			if ( ! empty( $org['tested'] ) && version_compare( $org['tested'], self::wp_target(), '<' ) ) {
-				$status    = ( 'red' === $status ) ? 'red' : 'amber';
-				$reasons[] = sprintf( /* translators: %s: WP version */ __( 'Tested only up to WordPress %s', 'upgrade-readiness-monitor' ), $org['tested'] );
+				if ( 'red' !== $status ) {
+					$status = 'amber';
+				}
+				$reasons[] = sprintf( /* translators: %s: WP version */ __( 'Warning: author tested only up to WordPress %s', 'upgrade-readiness-monitor' ), $org['tested'] );
 			}
 			if ( ! empty( $org['version'] ) && version_compare( $org['version'], $installed_version ? $installed_version : '0', '>' ) ) {
 				if ( 'green' === $status ) {
 					$status = 'amber';
 				}
-				$reasons[] = sprintf( /* translators: %s: version */ __( 'Update available (%s)', 'upgrade-readiness-monitor' ), $org['version'] );
+				$reasons[] = sprintf( /* translators: %s: version */ __( 'Info: update available (%s)', 'upgrade-readiness-monitor' ), $org['version'] );
+			}
+		} else {
+			$reasons[] = __( 'Not on WordPress.org (custom/premium) — checked by local code scan.', 'upgrade-readiness-monitor' );
+		}
+
+		// 3) Static code scan against the selected targets (all items).
+		if ( $dir ) {
+			$scan = self::static_scan( $dir );
+			foreach ( $scan['errors'] as $msg ) {
+				$status    = 'red';
+				$reasons[] = sprintf( /* translators: %s: message */ __( 'Error: %s', 'upgrade-readiness-monitor' ), $msg );
+			}
+			foreach ( $scan['warnings'] as $msg ) {
+				if ( 'red' !== $status ) {
+					$status = 'amber';
+				}
+				$reasons[] = sprintf( /* translators: %s: message */ __( 'Warning: %s', 'upgrade-readiness-monitor' ), $msg );
+			}
+			if ( ! empty( $scan['truncated'] ) ) {
+				$reasons[] = __( 'Note: local scan was partial (large codebase).', 'upgrade-readiness-monitor' );
 			}
 		}
 
+		// Keep rows readable.
+		if ( count( $reasons ) > 15 ) {
+			$extra   = count( $reasons ) - 15;
+			$reasons = array_slice( $reasons, 0, 15 );
+			$reasons[] = sprintf( /* translators: %d: count */ __( '…and %d more', 'upgrade-readiness-monitor' ), $extra );
+		}
+
 		if ( empty( $reasons ) ) {
-			$reasons[] = __( 'No issues detected.', 'upgrade-readiness-monitor' );
+			$reasons[] = __( 'No issues detected for the selected targets.', 'upgrade-readiness-monitor' );
 		}
 
 		return array( $status, $reasons );
@@ -978,23 +994,9 @@ class D9_Upgrade_Readiness_Monitor {
 
 		$names = array();
 		foreach ( array_unique( $files ) as $file ) {
-			if ( ! is_readable( $file ) ) {
-				continue;
+			if ( is_readable( $file ) ) {
+				$names += self::function_names_from_code( (string) file_get_contents( $file ) );
 			}
-			$tokens = @token_get_all( (string) file_get_contents( $file ) ); // phpcs:ignore
-			$total  = count( $tokens );
-			for ( $i = 0; $i < $total; $i++ ) {
-				if ( is_array( $tokens[ $i ] ) && T_FUNCTION === $tokens[ $i ][0] ) {
-					$j = $i + 1;
-					while ( $j < $total && is_array( $tokens[ $j ] ) && T_WHITESPACE === $tokens[ $j ][0] ) {
-						$j++;
-					}
-					if ( $j < $total && is_array( $tokens[ $j ] ) && T_STRING === $tokens[ $j ][0] ) {
-						$names[ strtolower( $tokens[ $j ][1] ) ] = true;
-					}
-				}
-			}
-			unset( $tokens );
 		}
 
 		$cache = $names;
@@ -1003,26 +1005,126 @@ class D9_Upgrade_Readiness_Monitor {
 	}
 
 	/**
-	 * A curated set of PHP functions removed or deprecated in PHP 8.x.
+	 * Extract top-level function names defined in a chunk of PHP.
 	 *
-	 * @since 1.3.0
+	 * Used to read function names out of WordPress core's deprecated.php files
+	 * (every function defined there is, by definition, deprecated).
+	 *
+	 * @since 1.5.0
+	 *
+	 * @param string $code PHP source.
+	 * @return array Map of lowercased function name => true.
+	 */
+	private static function function_names_from_code( $code ) {
+		$names  = array();
+		$tokens = @token_get_all( $code ); // phpcs:ignore
+		$total  = count( $tokens );
+		for ( $i = 0; $i < $total; $i++ ) {
+			if ( is_array( $tokens[ $i ] ) && T_FUNCTION === $tokens[ $i ][0] ) {
+				$j = $i + 1;
+				while ( $j < $total && is_array( $tokens[ $j ] ) && T_WHITESPACE === $tokens[ $j ][0] ) {
+					$j++;
+				}
+				if ( $j < $total && is_array( $tokens[ $j ] ) && T_STRING === $tokens[ $j ][0] ) {
+					$names[ strtolower( $tokens[ $j ][1] ) ] = true;
+				}
+			}
+		}
+		unset( $tokens );
+		return $names;
+	}
+
+	/**
+	 * Functions deprecated in the *target* WordPress version, fetched from
+	 * WordPress core itself so we can flag what an upgrade will newly deprecate.
+	 *
+	 * Cached per target for a week; runs only in the background scan / CLI.
+	 * Returns an empty set (graceful) if the target isn't newer or the fetch
+	 * fails — we never invent findings.
+	 *
+	 * @since 1.5.0
 	 *
 	 * @return array Map of lowercased function name => true.
 	 */
-	private static function deprecated_php_functions() {
+	private static function target_wp_deprecated_functions() {
+		$target = self::wp_target();
+
+		static $memo = array();
+		if ( isset( $memo[ $target ] ) ) {
+			return $memo[ $target ];
+		}
+
+		// Nothing newly deprecated if the target isn't above the current version.
+		if ( ! version_compare( $target, self::wp_major(), '>' ) ) {
+			$memo[ $target ] = array();
+			return array();
+		}
+
+		$key    = 'd9urm_wp_dep_' . preg_replace( '/[^0-9.]/', '', $target );
+		$cached = get_transient( $key );
+		if ( is_array( $cached ) ) {
+			$memo[ $target ] = $cached;
+			return $cached;
+		}
+
+		$names = array();
+		$base  = 'https://core.svn.wordpress.org/tags/' . rawurlencode( $target ) . '/';
+		$files = array(
+			'wp-includes/deprecated.php',
+			'wp-includes/pluggable-deprecated.php',
+			'wp-admin/includes/deprecated.php',
+		);
+		foreach ( $files as $rel ) {
+			$response = wp_remote_get( $base . $rel, array( 'timeout' => 12 ) );
+			if ( is_wp_error( $response ) || 200 !== (int) wp_remote_retrieve_response_code( $response ) ) {
+				continue;
+			}
+			$names += self::function_names_from_code( (string) wp_remote_retrieve_body( $response ) );
+		}
+
+		// Cache for a week (released versions don't change). Empty result is
+		// cached briefly so a transient network failure retries sooner.
+		set_transient( $key, $names, empty( $names ) ? HOUR_IN_SECONDS : WEEK_IN_SECONDS );
+		$memo[ $target ] = $names;
+		return $names;
+	}
+
+	/**
+	 * PHP functions removed or deprecated by version. Conservative and
+	 * hand-verified against the PHP migration guides — we only assert breakage
+	 * we're confident about, and clearly mark "removed" (fatal) vs "deprecated".
+	 *
+	 * @since 1.5.0
+	 *
+	 * @return array name => array( status: removed|deprecated, since: version )
+	 */
+	private static function php_function_map() {
 		return array(
-			'create_function'          => true,
-			'each'                     => true,
-			'money_format'             => true,
-			'convert_cyr_string'       => true,
-			'ezmlm_hash'               => true,
-			'restore_include_path'     => true,
-			'get_magic_quotes_gpc'     => true,
-			'get_magic_quotes_runtime' => true,
-			'hebrevc'                  => true,
-			'fgetss'                   => true,
-			'utf8_encode'              => true,
-			'utf8_decode'              => true,
+			// Removed — calling these is a fatal "undefined function" error.
+			'create_function'          => array( 'status' => 'removed', 'since' => '8.0' ),
+			'each'                     => array( 'status' => 'removed', 'since' => '8.0' ),
+			'money_format'             => array( 'status' => 'removed', 'since' => '8.0' ),
+			'convert_cyr_string'       => array( 'status' => 'removed', 'since' => '8.0' ),
+			'ezmlm_hash'               => array( 'status' => 'removed', 'since' => '8.0' ),
+			'get_magic_quotes_gpc'     => array( 'status' => 'removed', 'since' => '8.0' ),
+			'get_magic_quotes_runtime' => array( 'status' => 'removed', 'since' => '8.0' ),
+			'hebrevc'                  => array( 'status' => 'removed', 'since' => '8.0' ),
+			'fgetss'                   => array( 'status' => 'removed', 'since' => '8.0' ),
+			'gmp_random'               => array( 'status' => 'removed', 'since' => '8.0' ),
+			'image2wbmp'               => array( 'status' => 'removed', 'since' => '8.0' ),
+			'png2wbmp'                 => array( 'status' => 'removed', 'since' => '8.0' ),
+			'wbmp2png'                 => array( 'status' => 'removed', 'since' => '8.0' ),
+			'define_syslog_variables'  => array( 'status' => 'removed', 'since' => '8.0' ),
+			'ldap_sort'                => array( 'status' => 'removed', 'since' => '8.0' ),
+			'restore_include_path'     => array( 'status' => 'removed', 'since' => '8.0' ),
+			// Deprecated — emits a deprecation notice on the target.
+			'date_sunrise'             => array( 'status' => 'deprecated', 'since' => '8.1' ),
+			'date_sunset'              => array( 'status' => 'deprecated', 'since' => '8.1' ),
+			'strftime'                 => array( 'status' => 'deprecated', 'since' => '8.1' ),
+			'gmstrftime'               => array( 'status' => 'deprecated', 'since' => '8.1' ),
+			'strptime'                 => array( 'status' => 'deprecated', 'since' => '8.1' ),
+			'utf8_encode'              => array( 'status' => 'deprecated', 'since' => '8.2' ),
+			'utf8_decode'              => array( 'status' => 'deprecated', 'since' => '8.2' ),
 		);
 	}
 
@@ -1036,10 +1138,16 @@ class D9_Upgrade_Readiness_Monitor {
 	 * @return array { wp: string[], php: string[], files: int, truncated: bool }
 	 */
 	public static function static_scan( $path ) {
-		$wp_dep    = self::deprecated_wp_functions();
-		$php_dep   = self::deprecated_php_functions();
-		$found_wp  = array();
-		$found_php = array();
+		$ctx = array(
+			'php'        => self::php_function_map(),
+			'wp_current' => self::deprecated_wp_functions(),
+			'wp_target'  => self::target_wp_deprecated_functions(),
+			'target_php' => self::php_target(),
+			'target_wp'  => self::wp_target(),
+		);
+
+		$errors    = array();
+		$warnings  = array();
 		$files     = 0;
 		$truncated = false;
 
@@ -1071,9 +1179,8 @@ class D9_Upgrade_Readiness_Monitor {
 				}
 			} catch ( Exception $e ) {
 				return array(
-					'wp'        => array(),
-					'php'       => array(),
-					'files'     => 0,
+					'errors'    => array(),
+					'warnings'  => array(),
 					'truncated' => false,
 				);
 			}
@@ -1083,31 +1190,31 @@ class D9_Upgrade_Readiness_Monitor {
 			if ( ! is_readable( $file ) || filesize( $file ) > D9URM_SCAN_MAX_FILESIZE ) {
 				continue;
 			}
-			self::scan_code( (string) file_get_contents( $file ), $wp_dep, $php_dep, $found_wp, $found_php );
+			self::scan_code( (string) file_get_contents( $file ), $ctx, $errors, $warnings );
 		}
 
 		return array(
-			'wp'        => array_keys( $found_wp ),
-			'php'       => array_keys( $found_php ),
-			'files'     => $files,
+			'errors'    => array_values( $errors ),
+			'warnings'  => array_values( $warnings ),
 			'truncated' => $truncated,
 		);
 	}
 
 	/**
-	 * Tokenize code and record any deprecated function *calls* found.
+	 * Tokenize code and classify deprecated/removed function *calls* against
+	 * the selected targets. Populates $errors (fatal) and $warnings (notice),
+	 * keyed by signature to de-duplicate.
 	 *
 	 * @since 1.3.0
 	 *
-	 * @param string $code      Source code.
-	 * @param array  $wp_dep    Deprecated WP function map.
-	 * @param array  $php_dep   Deprecated PHP function map.
-	 * @param array  $found_wp  Accumulator (by reference).
-	 * @param array  $found_php Accumulator (by reference).
+	 * @param string $code     Source code.
+	 * @param array  $ctx      Scan context (maps + targets).
+	 * @param array  $errors   Accumulator (by reference).
+	 * @param array  $warnings Accumulator (by reference).
 	 */
-	private static function scan_code( $code, $wp_dep, $php_dep, &$found_wp, &$found_php ) {
-		$tokens = @token_get_all( $code ); // phpcs:ignore
-		$total  = count( $tokens );
+	private static function scan_code( $code, $ctx, &$errors, &$warnings ) {
+		$tokens    = @token_get_all( $code ); // phpcs:ignore
+		$total     = count( $tokens );
 		$skip_prev = array( T_OBJECT_OPERATOR, T_DOUBLE_COLON, T_FUNCTION, T_NEW );
 		$skip_ws   = array( T_WHITESPACE, T_COMMENT, T_DOC_COMMENT );
 
@@ -1116,10 +1223,11 @@ class D9_Upgrade_Readiness_Monitor {
 			if ( ! is_array( $tok ) || T_STRING !== $tok[0] ) {
 				continue;
 			}
-			$name   = strtolower( $tok[1] );
-			$is_wp  = isset( $wp_dep[ $name ] );
-			$is_php = isset( $php_dep[ $name ] );
-			if ( ! $is_wp && ! $is_php ) {
+			$name = strtolower( $tok[1] );
+
+			$in_php       = isset( $ctx['php'][ $name ] );
+			$newly_wp_dep = isset( $ctx['wp_target'][ $name ] ) && ! isset( $ctx['wp_current'][ $name ] );
+			if ( ! $in_php && ! $newly_wp_dep ) {
 				continue;
 			}
 
@@ -1141,11 +1249,34 @@ class D9_Upgrade_Readiness_Monitor {
 				continue;
 			}
 
-			if ( $is_wp ) {
-				$found_wp[ $name ] = true;
+			if ( $in_php ) {
+				$info = $ctx['php'][ $name ];
+				if ( version_compare( $ctx['target_php'], $info['since'], '>=' ) ) {
+					if ( 'removed' === $info['status'] ) {
+						$errors[ 'php:' . $name ] = sprintf(
+							/* translators: 1: function, 2: PHP version */
+							__( '%1$s() was removed in PHP %2$s (will fatal)', 'upgrade-readiness-monitor' ),
+							$name,
+							$info['since']
+						);
+					} else {
+						$warnings[ 'php:' . $name ] = sprintf(
+							/* translators: 1: function, 2: PHP version */
+							__( '%1$s() is deprecated as of PHP %2$s', 'upgrade-readiness-monitor' ),
+							$name,
+							$info['since']
+						);
+					}
+				}
 			}
-			if ( $is_php ) {
-				$found_php[ $name ] = true;
+
+			if ( $newly_wp_dep ) {
+				$warnings[ 'wp:' . $name ] = sprintf(
+					/* translators: 1: function, 2: WordPress version */
+					__( '%1$s() is deprecated in WordPress %2$s', 'upgrade-readiness-monitor' ),
+					$name,
+					$ctx['target_wp']
+				);
 			}
 		}
 		unset( $tokens );
@@ -1513,7 +1644,12 @@ class D9_Upgrade_Readiness_Monitor {
 				<button type="button" class="button button-primary" id="d9urm-scan"><?php esc_html_e( 'Scan now', 'upgrade-readiness-monitor' ); ?></button>
 				<span id="d9urm-scan-status" style="margin-left:10px;"></span>
 			</p>
-			<p class="description"><?php esc_html_e( 'The scan runs in the background and includes your active theme. You can safely leave or reload this page while it runs.', 'upgrade-readiness-monitor' ); ?></p>
+			<p class="description">
+				<?php esc_html_e( 'The scan runs in the background (it reads each plugin and theme\'s code against your selected targets) and includes your active theme. You can safely leave or reload this page while it runs.', 'upgrade-readiness-monitor' ); ?>
+				<br />
+				<strong><?php esc_html_e( 'Error', 'upgrade-readiness-monitor' ); ?></strong> <?php esc_html_e( '= will break on the target (e.g. a function removed in the target PHP).', 'upgrade-readiness-monitor' ); ?>
+				&nbsp; <strong><?php esc_html_e( 'Warning', 'upgrade-readiness-monitor' ); ?></strong> <?php esc_html_e( '= a deprecation notice or upgrade risk to review.', 'upgrade-readiness-monitor' ); ?>
+			</p>
 			<?php if ( $fresh && ! empty( $results['completed_at'] ) ) : ?>
 				<p class="description" id="d9urm-last-scan">
 					<?php
@@ -1700,7 +1836,7 @@ JS;
 		delete_transient( 'd9urm_wp_deprecated' );
 		wp_clear_scheduled_hook( 'd9urm_weekly_scan' );
 		wp_clear_scheduled_hook( 'd9urm_run_scan_chunk' );
-		$wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient_d9urm_org%' OR option_name LIKE '_transient_timeout_d9urm_org%'" ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+		$wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient_d9urm_%' OR option_name LIKE '_transient_timeout_d9urm_%'" ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
 	}
 }
 
