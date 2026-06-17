@@ -79,6 +79,7 @@ class D9_Upgrade_Readiness_Monitor {
 		// Admin UI.
 		add_action( 'admin_menu', array( $this, 'add_menu' ) );
 		add_action( 'admin_enqueue_scripts', array( $this, 'enqueue' ) );
+		add_filter( 'plugin_action_links_' . plugin_basename( D9URM_FILE ), array( $this, 'action_links' ) );
 
 		// AJAX.
 		add_action( 'wp_ajax_d9urm_scan', array( $this, 'ajax_scan' ) );
@@ -537,6 +538,25 @@ class D9_Upgrade_Readiness_Monitor {
 			D9URM_SLUG,
 			array( $this, 'render_page' )
 		);
+	}
+
+	/**
+	 * Add a quick-access link to the report on the Plugins list row.
+	 *
+	 * @since 1.0.0
+	 *
+	 * @param array $links Existing action links.
+	 * @return array
+	 */
+	public function action_links( $links ) {
+		$link = sprintf(
+			'<a href="%s">%s</a>',
+			esc_url( admin_url( 'tools.php?page=' . D9URM_SLUG ) ),
+			esc_html__( 'View report', 'upgrade-readiness-monitor' )
+		);
+		array_unshift( $links, $link );
+
+		return $links;
 	}
 
 	/**
