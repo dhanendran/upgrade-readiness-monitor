@@ -11,7 +11,7 @@
  * Plugin Name:       Upgrade Readiness Monitor
  * Plugin URI:        https://github.com/dhanendran/upgrade-readiness-monitor
  * Description:       Know before you upgrade. Captures deprecation notices in real time (even with WP_DEBUG off) and audits your plugins and theme for PHP/WordPress compatibility in the background — with a clear readiness verdict and a WP-CLI command for CI.
- * Version:           1.6.0
+ * Version:           1.6.1
  * Author:            D9 Labs
  * Author URI:        https://d9labs.io
  * License:           GPL-2.0-or-later
@@ -26,7 +26,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	die;
 }
 
-define( 'D9URM_VERSION', '1.6.0' );
+define( 'D9URM_VERSION', '1.6.1' );
 define( 'D9URM_FILE', __FILE__ );
 define( 'D9URM_SLUG', 'upgrade-readiness-monitor' );
 
@@ -1903,8 +1903,8 @@ JS;
 	}
 }
 
-$d9urm = new D9_Upgrade_Readiness_Monitor();
-$d9urm->init();
+// Boot the plugin (no global variable kept; hooks hold the instance).
+( new D9_Upgrade_Readiness_Monitor() )->init();
 
 /**
  * WP-CLI command.
@@ -1916,7 +1916,7 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 	/**
 	 * Report whether the site is ready to upgrade PHP / WordPress.
 	 */
-	class D9_URM_CLI {
+	class D9URM_CLI {
 
 		/**
 		 * Show an upgrade-readiness report.
@@ -1980,5 +1980,5 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 		}
 	}
 
-	WP_CLI::add_command( 'readiness', 'D9_URM_CLI' );
+	WP_CLI::add_command( 'readiness', 'D9URM_CLI' );
 }

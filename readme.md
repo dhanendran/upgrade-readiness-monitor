@@ -4,7 +4,7 @@ Tags: deprecation, php compatibility, upgrade, developer, site health
 Requires at least: 5.4
 Tested up to: 7.0
 Requires PHP: 7.4
-Stable tag: 1.6.0
+Stable tag: 1.6.1
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -75,6 +75,9 @@ The scan is precise rather than exhaustive: it reports problems it is confident 
 If WordPress.org can't be reached, the target-version deprecation check is simply skipped (you'll still get the PHP checks, metadata signals, and runtime capture). The tool never fabricates results from missing data.
 
 == Changelog ==
+
+= 1.6.1 =
+* [Fix] Renamed the WP-CLI class to use the plugin prefix (Plugin Check naming compliance); no functional change.
 
 = 1.6.0 =
 * [Fix] Scans could appear stuck at "0%" on sites where WP-Cron doesn't fire promptly (e.g. low-traffic or local environments). The scan is now driven forward by the report page itself in bounded chunks, so it always progresses while the page is open; WP-Cron remains the fallback for unattended weekly scans. A short lock prevents the two paths from colliding.
