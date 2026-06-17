@@ -11,7 +11,7 @@
  * Plugin Name:       Upgrade Readiness Monitor
  * Plugin URI:        https://github.com/dhanendran/upgrade-readiness-monitor
  * Description:       Know before you upgrade. Captures deprecation notices in real time (even with WP_DEBUG off) and audits your plugins and theme for PHP/WordPress compatibility in the background — with a clear readiness verdict and a WP-CLI command for CI.
- * Version:           1.2.2
+ * Version:           1.3.0
  * Author:            D9 Labs
  * Author URI:        https://d9labs.io
  * License:           GPL-2.0-or-later
@@ -26,7 +26,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	die;
 }
 
-define( 'D9URM_VERSION', '1.2.2' );
+define( 'D9URM_VERSION', '1.3.0' );
 define( 'D9URM_FILE', __FILE__ );
 define( 'D9URM_SLUG', 'upgrade-readiness-monitor' );
 
@@ -38,6 +38,8 @@ define( 'D9URM_RESULTS_SCHEMA', 2 );      // Bump when the audit row shape chang
 define( 'D9URM_LOG_CAP', 300 );          // Max distinct deprecation notices stored.
 define( 'D9URM_CAPTURE_PER_REQUEST', 25 ); // Max new captures per request (perf guard).
 define( 'D9URM_SCAN_CHUNK', 3 );          // Plugins audited per background tick.
+define( 'D9URM_SCAN_MAX_FILES', 800 );    // Max PHP files statically scanned per non-.org item.
+define( 'D9URM_SCAN_MAX_FILESIZE', 524288 ); // Skip files larger than 512KB (likely minified/vendor).
 
 // The PHP version sites should be ready for (latest stable line).
 if ( ! defined( 'D9URM_TARGET_PHP' ) ) {
@@ -107,6 +109,7 @@ class D9_Upgrade_Readiness_Monitor {
 		add_action( 'wp_ajax_d9urm_start_scan', array( $this, 'ajax_start_scan' ) );
 		add_action( 'wp_ajax_d9urm_scan_status', array( $this, 'ajax_scan_status' ) );
 		add_action( 'wp_ajax_d9urm_clear', array( $this, 'ajax_clear' ) );
+		add_action( 'wp_ajax_d9urm_deprecations', array( $this, 'ajax_deprecations' ) );
 	}
 
 	/**
@@ -583,7 +586,10 @@ class D9_Upgrade_Readiness_Monitor {
 		$slug = ( false !== strpos( $file, '/' ) ) ? dirname( $file ) : basename( $file, '.php' );
 		$org  = self::org_plugin_info( $slug );
 
-		list( $status, $reasons ) = self::evaluate( $org, $data['Version'] ?? '', $data['RequiresPHP'] ?? '' );
+		// Directory (or single file) to scan locally if it's not on WordPress.org.
+		$path = ( false !== strpos( $file, '/' ) ) ? WP_PLUGIN_DIR . '/' . dirname( $file ) : WP_PLUGIN_DIR . '/' . $file;
+
+		list( $status, $reasons ) = self::evaluate( $org, $data['Version'] ?? '', $data['RequiresPHP'] ?? '', $path );
 
 		return array(
 			'kind'    => 'plugin',
@@ -612,7 +618,7 @@ class D9_Upgrade_Readiness_Monitor {
 
 		$org = self::org_theme_info( $stylesheet );
 
-		list( $status, $reasons ) = self::evaluate( $org, (string) $theme->get( 'Version' ), (string) $theme->get( 'RequiresPHP' ) );
+		list( $status, $reasons ) = self::evaluate( $org, (string) $theme->get( 'Version' ), (string) $theme->get( 'RequiresPHP' ), $theme->get_stylesheet_directory() );
 
 		return array(
 			'kind'    => 'theme',
@@ -635,7 +641,7 @@ class D9_Upgrade_Readiness_Monitor {
 	 * @param string     $requires_php      Declared PHP requirement.
 	 * @return array [ status, reasons ]
 	 */
-	private static function evaluate( $org, $installed_version, $requires_php ) {
+	private static function evaluate( $org, $installed_version, $requires_php, $dir = '' ) {
 		$reasons = array();
 		$status  = 'green';
 
@@ -645,8 +651,27 @@ class D9_Upgrade_Readiness_Monitor {
 		}
 
 		if ( null === $org ) {
-			$status    = ( 'red' === $status ) ? 'red' : 'amber';
-			$reasons[] = __( 'Not on WordPress.org — cannot verify; test manually.', 'upgrade-readiness-monitor' );
+			// Not on WordPress.org (custom/premium): scan the actual code locally.
+			if ( $dir ) {
+				$scan = self::static_scan( $dir );
+				if ( ! empty( $scan['wp'] ) ) {
+					$status    = ( 'red' === $status ) ? 'red' : 'amber';
+					$reasons[] = sprintf( /* translators: %s: function list */ __( 'Local scan: uses deprecated WordPress function(s): %s', 'upgrade-readiness-monitor' ), implode( ', ', array_slice( $scan['wp'], 0, 12 ) ) );
+				}
+				if ( ! empty( $scan['php'] ) ) {
+					$status    = ( 'red' === $status ) ? 'red' : 'amber';
+					$reasons[] = sprintf( /* translators: %s: function list */ __( 'Local scan: uses function(s) removed/deprecated in PHP: %s', 'upgrade-readiness-monitor' ), implode( ', ', array_slice( $scan['php'], 0, 12 ) ) );
+				}
+				if ( empty( $scan['wp'] ) && empty( $scan['php'] ) ) {
+					$reasons[] = __( 'Not on WordPress.org; local code scan found no deprecated function usage.', 'upgrade-readiness-monitor' );
+				}
+				if ( ! empty( $scan['truncated'] ) ) {
+					$reasons[] = __( '(Local scan was partial — large codebase.)', 'upgrade-readiness-monitor' );
+				}
+			} else {
+				$status    = ( 'red' === $status ) ? 'red' : 'amber';
+				$reasons[] = __( 'Not on WordPress.org — cannot verify; test manually.', 'upgrade-readiness-monitor' );
+			}
 		} else {
 			if ( ! empty( $org['last_updated'] ) ) {
 				$ts = strtotime( $org['last_updated'] );
@@ -830,6 +855,227 @@ class D9_Upgrade_Readiness_Monitor {
 	}
 
 	/**
+	 * Deprecated WordPress function names, parsed from core's own deprecated
+	 * files so the list always matches the running version. Cached.
+	 *
+	 * @since 1.3.0
+	 *
+	 * @return array Map of lowercased function name => true.
+	 */
+	private static function deprecated_wp_functions() {
+		static $cache = null;
+		if ( null !== $cache ) {
+			return $cache;
+		}
+		$cached = get_transient( 'd9urm_wp_deprecated' );
+		if ( is_array( $cached ) ) {
+			$cache = $cached;
+			return $cache;
+		}
+
+		$files = array(
+			ABSPATH . 'wp-includes/deprecated.php',
+			ABSPATH . 'wp-includes/pluggable-deprecated.php',
+			ABSPATH . 'wp-includes/ms-deprecated.php',
+			ABSPATH . 'wp-admin/includes/deprecated.php',
+			ABSPATH . 'wp-admin/includes/ms-deprecated.php',
+		);
+
+		$names = array();
+		foreach ( array_unique( $files ) as $file ) {
+			if ( ! is_readable( $file ) ) {
+				continue;
+			}
+			$tokens = @token_get_all( (string) file_get_contents( $file ) ); // phpcs:ignore
+			$total  = count( $tokens );
+			for ( $i = 0; $i < $total; $i++ ) {
+				if ( is_array( $tokens[ $i ] ) && T_FUNCTION === $tokens[ $i ][0] ) {
+					$j = $i + 1;
+					while ( $j < $total && is_array( $tokens[ $j ] ) && T_WHITESPACE === $tokens[ $j ][0] ) {
+						$j++;
+					}
+					if ( $j < $total && is_array( $tokens[ $j ] ) && T_STRING === $tokens[ $j ][0] ) {
+						$names[ strtolower( $tokens[ $j ][1] ) ] = true;
+					}
+				}
+			}
+			unset( $tokens );
+		}
+
+		$cache = $names;
+		set_transient( 'd9urm_wp_deprecated', $names, 12 * HOUR_IN_SECONDS );
+		return $cache;
+	}
+
+	/**
+	 * A curated set of PHP functions removed or deprecated in PHP 8.x.
+	 *
+	 * @since 1.3.0
+	 *
+	 * @return array Map of lowercased function name => true.
+	 */
+	private static function deprecated_php_functions() {
+		return array(
+			'create_function'          => true,
+			'each'                     => true,
+			'money_format'             => true,
+			'convert_cyr_string'       => true,
+			'ezmlm_hash'               => true,
+			'restore_include_path'     => true,
+			'get_magic_quotes_gpc'     => true,
+			'get_magic_quotes_runtime' => true,
+			'hebrevc'                  => true,
+			'fgetss'                   => true,
+			'utf8_encode'              => true,
+			'utf8_decode'              => true,
+		);
+	}
+
+	/**
+	 * Statically scan a plugin/theme directory (or single file) for usage of
+	 * deprecated WordPress or PHP functions. Bounded for safety.
+	 *
+	 * @since 1.3.0
+	 *
+	 * @param string $path Directory or file path.
+	 * @return array { wp: string[], php: string[], files: int, truncated: bool }
+	 */
+	public static function static_scan( $path ) {
+		$wp_dep    = self::deprecated_wp_functions();
+		$php_dep   = self::deprecated_php_functions();
+		$found_wp  = array();
+		$found_php = array();
+		$files     = 0;
+		$truncated = false;
+
+		$targets = array();
+		if ( is_file( $path ) ) {
+			$targets[] = $path;
+		} elseif ( is_dir( $path ) ) {
+			$skip = array( 'vendor', 'node_modules', 'tests', 'test', 'dist', 'build', '.git' );
+			try {
+				$iterator = new RecursiveIteratorIterator(
+					new RecursiveDirectoryIterator( $path, FilesystemIterator::SKIP_DOTS )
+				);
+				foreach ( $iterator as $entry ) {
+					if ( $files >= D9URM_SCAN_MAX_FILES ) {
+						$truncated = true;
+						break;
+					}
+					if ( ! $entry->isFile() || 'php' !== strtolower( $entry->getExtension() ) ) {
+						continue;
+					}
+					$full = wp_normalize_path( $entry->getPathname() );
+					foreach ( $skip as $dir ) {
+						if ( false !== strpos( $full, '/' . $dir . '/' ) ) {
+							continue 2;
+						}
+					}
+					$targets[] = $entry->getPathname();
+					$files++;
+				}
+			} catch ( Exception $e ) {
+				return array(
+					'wp'        => array(),
+					'php'       => array(),
+					'files'     => 0,
+					'truncated' => false,
+				);
+			}
+		}
+
+		foreach ( $targets as $file ) {
+			if ( ! is_readable( $file ) || filesize( $file ) > D9URM_SCAN_MAX_FILESIZE ) {
+				continue;
+			}
+			self::scan_code( (string) file_get_contents( $file ), $wp_dep, $php_dep, $found_wp, $found_php );
+		}
+
+		return array(
+			'wp'        => array_keys( $found_wp ),
+			'php'       => array_keys( $found_php ),
+			'files'     => $files,
+			'truncated' => $truncated,
+		);
+	}
+
+	/**
+	 * Tokenize code and record any deprecated function *calls* found.
+	 *
+	 * @since 1.3.0
+	 *
+	 * @param string $code      Source code.
+	 * @param array  $wp_dep    Deprecated WP function map.
+	 * @param array  $php_dep   Deprecated PHP function map.
+	 * @param array  $found_wp  Accumulator (by reference).
+	 * @param array  $found_php Accumulator (by reference).
+	 */
+	private static function scan_code( $code, $wp_dep, $php_dep, &$found_wp, &$found_php ) {
+		$tokens = @token_get_all( $code ); // phpcs:ignore
+		$total  = count( $tokens );
+		$skip_prev = array( T_OBJECT_OPERATOR, T_DOUBLE_COLON, T_FUNCTION, T_NEW );
+		$skip_ws   = array( T_WHITESPACE, T_COMMENT, T_DOC_COMMENT );
+
+		for ( $i = 0; $i < $total; $i++ ) {
+			$tok = $tokens[ $i ];
+			if ( ! is_array( $tok ) || T_STRING !== $tok[0] ) {
+				continue;
+			}
+			$name   = strtolower( $tok[1] );
+			$is_wp  = isset( $wp_dep[ $name ] );
+			$is_php = isset( $php_dep[ $name ] );
+			if ( ! $is_wp && ! $is_php ) {
+				continue;
+			}
+
+			// Previous significant token: skip method calls / definitions / new.
+			$p = $i - 1;
+			while ( $p >= 0 && is_array( $tokens[ $p ] ) && in_array( $tokens[ $p ][0], $skip_ws, true ) ) {
+				$p--;
+			}
+			if ( $p >= 0 && is_array( $tokens[ $p ] ) && in_array( $tokens[ $p ][0], $skip_prev, true ) ) {
+				continue;
+			}
+
+			// Next significant token must be "(" to be a function call.
+			$n = $i + 1;
+			while ( $n < $total && is_array( $tokens[ $n ] ) && in_array( $tokens[ $n ][0], $skip_ws, true ) ) {
+				$n++;
+			}
+			if ( $n >= $total || '(' !== $tokens[ $n ] ) {
+				continue;
+			}
+
+			if ( $is_wp ) {
+				$found_wp[ $name ] = true;
+			}
+			if ( $is_php ) {
+				$found_php[ $name ] = true;
+			}
+		}
+		unset( $tokens );
+	}
+
+	/**
+	 * Get the deprecation log, sorted by most-recently-seen.
+	 *
+	 * @since 1.3.0
+	 *
+	 * @return array
+	 */
+	private static function get_deprecation_log() {
+		$log = get_option( D9URM_LOG_OPTION, array() );
+		$log = is_array( $log ) ? $log : array();
+		uasort(
+			$log,
+			static function ( $a, $b ) {
+				return ( $b['last_seen'] ?? 0 ) <=> ( $a['last_seen'] ?? 0 );
+			}
+		);
+		return $log;
+	}
+
+	/**
 	 * Synchronous full audit (WP-CLI only — devs accept the runtime, and the
 	 * field-restricted API keeps memory low).
 	 *
@@ -930,6 +1176,64 @@ class D9_Upgrade_Readiness_Monitor {
 		wp_send_json_success();
 	}
 
+	/**
+	 * Return the current deprecation section markup (for live refresh).
+	 *
+	 * @since 1.3.0
+	 */
+	public function ajax_deprecations() {
+		check_ajax_referer( 'd9urm', 'nonce' );
+		if ( ! current_user_can( 'activate_plugins' ) ) {
+			wp_send_json_error( array( 'message' => __( 'Permission denied.', 'upgrade-readiness-monitor' ) ), 403 );
+		}
+		wp_send_json_success( array( 'html' => $this->deprecation_section_html() ) );
+	}
+
+	/**
+	 * Build the deprecation-notices section (used on first render and refresh).
+	 *
+	 * @since 1.3.0
+	 *
+	 * @return string
+	 */
+	private function deprecation_section_html() {
+		$log = self::get_deprecation_log();
+
+		ob_start();
+		if ( empty( $log ) ) {
+			echo '<p id="d9urm-no-deprecations">' . esc_html__( 'No deprecation notices captured yet. Keep browsing your site and admin — anything deprecated will show up here, then use Refresh.', 'upgrade-readiness-monitor' ) . '</p>';
+			echo '<p><button type="button" class="button" id="d9urm-refresh-dep">' . esc_html__( 'Refresh', 'upgrade-readiness-monitor' ) . '</button></p>';
+		} else {
+			echo '<p>';
+			echo '<button type="button" class="button" id="d9urm-clear">' . esc_html__( 'Clear log', 'upgrade-readiness-monitor' ) . '</button> ';
+			echo '<button type="button" class="button" id="d9urm-refresh-dep">' . esc_html__( 'Refresh', 'upgrade-readiness-monitor' ) . '</button>';
+			echo '</p>';
+			echo '<table class="widefat striped"><thead><tr>';
+			echo '<th>' . esc_html__( 'Source', 'upgrade-readiness-monitor' ) . '</th>';
+			echo '<th>' . esc_html__( 'Type', 'upgrade-readiness-monitor' ) . '</th>';
+			echo '<th>' . esc_html__( 'What', 'upgrade-readiness-monitor' ) . '</th>';
+			echo '<th>' . esc_html__( 'Since', 'upgrade-readiness-monitor' ) . '</th>';
+			echo '<th>' . esc_html__( 'Hits', 'upgrade-readiness-monitor' ) . '</th>';
+			echo '</tr></thead><tbody>';
+			foreach ( $log as $entry ) {
+				$source = ( '' !== $entry['source_name'] ) ? $entry['source_name'] : __( 'Unknown / core', 'upgrade-readiness-monitor' );
+				echo '<tr>';
+				echo '<td>' . esc_html( $source ) . ' <code>' . esc_html( $entry['source_type'] ) . '</code></td>';
+				echo '<td>' . esc_html( $entry['type'] ) . '</td>';
+				echo '<td><code>' . esc_html( $entry['label'] ) . '</code>';
+				if ( ! empty( $entry['message'] ) ) {
+					echo '<br /><small>' . esc_html( wp_strip_all_tags( $entry['message'] ) ) . '</small>';
+				}
+				echo '</td>';
+				echo '<td>' . esc_html( $entry['version'] ) . '</td>';
+				echo '<td>' . esc_html( number_format_i18n( $entry['count'] ) ) . '</td>';
+				echo '</tr>';
+			}
+			echo '</tbody></table>';
+		}
+		return ob_get_clean();
+	}
+
 	/* ---------------------------------------------------------------------
 	 * Admin UI
 	 * ------------------------------------------------------------------- */
@@ -1026,14 +1330,6 @@ class D9_Upgrade_Readiness_Monitor {
 		// so an upgrade prompts a clean re-scan instead of showing mixed data.
 		$fresh       = isset( $results['schema'] ) && (int) $results['schema'] >= D9URM_RESULTS_SCHEMA;
 		$result_rows = $fresh ? ( $results['rows'] ?? array() ) : array();
-		$log         = get_option( D9URM_LOG_OPTION, array() );
-		$log     = is_array( $log ) ? $log : array();
-		uasort(
-			$log,
-			static function ( $a, $b ) {
-				return ( $b['last_seen'] ?? 0 ) <=> ( $a['last_seen'] ?? 0 );
-			}
-		);
 		?>
 		<div class="wrap d9urm">
 			<h1><?php esc_html_e( 'Upgrade Readiness', 'upgrade-readiness-monitor' ); ?></h1>
@@ -1116,44 +1412,12 @@ class D9_Upgrade_Readiness_Monitor {
 			</table>
 
 			<h2 style="margin-top:2em;"><?php esc_html_e( 'Captured deprecation notices', 'upgrade-readiness-monitor' ); ?></h2>
-			<?php if ( empty( $log ) ) : ?>
-				<p id="d9urm-no-deprecations"><?php esc_html_e( 'No deprecation notices captured yet. Keep browsing your site and admin — anything deprecated will show up here.', 'upgrade-readiness-monitor' ); ?></p>
-			<?php else : ?>
-				<p><button type="button" class="button" id="d9urm-clear"><?php esc_html_e( 'Clear log', 'upgrade-readiness-monitor' ); ?></button></p>
-				<table class="widefat striped" id="d9urm-deprecations">
-					<thead>
-						<tr>
-							<th><?php esc_html_e( 'Source', 'upgrade-readiness-monitor' ); ?></th>
-							<th><?php esc_html_e( 'Type', 'upgrade-readiness-monitor' ); ?></th>
-							<th><?php esc_html_e( 'What', 'upgrade-readiness-monitor' ); ?></th>
-							<th><?php esc_html_e( 'Since', 'upgrade-readiness-monitor' ); ?></th>
-							<th><?php esc_html_e( 'Hits', 'upgrade-readiness-monitor' ); ?></th>
-						</tr>
-					</thead>
-					<tbody>
-						<?php foreach ( $log as $entry ) : ?>
-							<tr>
-								<td>
-									<?php
-									$source_name = '' !== $entry['source_name'] ? $entry['source_name'] : __( 'Unknown / core', 'upgrade-readiness-monitor' );
-									echo esc_html( $source_name );
-									?>
-									<code><?php echo esc_html( $entry['source_type'] ); ?></code>
-								</td>
-								<td><?php echo esc_html( $entry['type'] ); ?></td>
-								<td>
-									<code><?php echo esc_html( $entry['label'] ); ?></code>
-									<?php if ( ! empty( $entry['message'] ) ) : ?>
-										<br /><small><?php echo esc_html( wp_strip_all_tags( $entry['message'] ) ); ?></small>
-									<?php endif; ?>
-								</td>
-								<td><?php echo esc_html( $entry['version'] ); ?></td>
-								<td><?php echo esc_html( number_format_i18n( $entry['count'] ) ); ?></td>
-							</tr>
-						<?php endforeach; ?>
-					</tbody>
-				</table>
-			<?php endif; ?>
+			<div id="d9urm-deprecations-wrap">
+				<?php
+				// Built with escaping inside deprecation_section_html().
+				echo $this->deprecation_section_html(); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
+				?>
+			</div>
 		</div>
 		<?php
 	}
@@ -1211,6 +1475,7 @@ class D9_Upgrade_Readiness_Monitor {
 					setStatus( i18n.done );
 					$( '#d9urm-scan' ).prop( 'disabled', false );
 					renderRows( results.rows );
+					refreshDeprecations();
 				}
 			} );
 		}, 2500 );
@@ -1227,16 +1492,28 @@ class D9_Upgrade_Readiness_Monitor {
 		} );
 	}
 
+	function refreshDeprecations() {
+		$.post( d.ajaxUrl, { action: 'd9urm_deprecations', nonce: d.nonce } ).done( function ( resp ) {
+			if ( resp && resp.success && resp.data ) {
+				$( '#d9urm-deprecations-wrap' ).html( resp.data.html );
+			}
+		} );
+	}
+
 	function clearLog() {
 		if ( ! window.confirm( i18n.confirm ) ) { return; }
 		$.post( d.ajaxUrl, { action: 'd9urm_clear', nonce: d.nonce } ).done( function () {
-			$( '#d9urm-deprecations, #d9urm-clear' ).remove();
+			refreshDeprecations();
 		} );
 	}
 
 	$( function () {
 		$( '#d9urm-scan' ).on( 'click', scan );
 		$( document ).on( 'click', '#d9urm-clear', clearLog );
+		$( document ).on( 'click', '#d9urm-refresh-dep', refreshDeprecations );
+
+		// Pick up notices captured since the page was rendered.
+		refreshDeprecations();
 
 		// If a scan is already running (e.g. the page was reloaded mid-scan),
 		// reattach to it and resume showing progress.

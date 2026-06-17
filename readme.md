@@ -4,7 +4,7 @@ Tags: deprecation, php compatibility, upgrade, developer, site health
 Requires at least: 5.4
 Tested up to: 7.0
 Requires PHP: 7.4
-Stable tag: 1.2.2
+Stable tag: 1.3.0
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -17,7 +17,8 @@ Upgrade Readiness Monitor tells you whether a site is safe to upgrade **before**
 It works in two complementary ways:
 
 * **Real-time deprecation capture.** The plugin listens for WordPress's deprecation signals (`deprecated_function_run`, `deprecated_hook_run`, `doing_it_wrong_run`, and friends) as your site runs. Because those signals fire *regardless of `WP_DEBUG`*, you catch real deprecations on production without turning on debug mode — each one attributed to the plugin or theme that triggered it.
-* **Plugin & theme audit.** A one-click scan checks every installed plugin against WordPress.org for abandoned code (no update in 2+ years), "tested up to" lag, available updates, and declared PHP requirements — and rolls everything into a single **green / amber / red** readiness verdict.
+* **Plugin & theme audit.** A one-click scan checks every installed plugin and your active theme against WordPress.org for abandoned code (no update in 2+ years), "tested up to" lag, available updates, and declared PHP requirements — and rolls everything into a single **green / amber / red** readiness verdict.
+* **Local scan for custom & premium code.** Plugins and themes that aren't on WordPress.org (custom builds, premium products) can't be checked against the directory — so they're scanned **locally** instead: their PHP is parsed for usage of deprecated WordPress functions (matched against your WordPress version's own deprecation list) and functions removed in recent PHP. This catches the very code most likely to break on an upgrade.
 
 = Built for developers and agencies =
 
@@ -54,6 +55,10 @@ No. WordPress fires its deprecation hooks whether or not `WP_DEBUG` is enabled, 
 It catches deprecations that actually run, plus header/registry-based compatibility signals. As with any tool, runtime-only issues still warrant testing on staging — but you'll start every upgrade knowing far more than before.
 
 == Changelog ==
+
+= 1.3.0 =
+* [Feature] Local code scan for plugins and themes that aren't on WordPress.org (custom/premium). Their PHP is statically scanned for deprecated WordPress functions (built from your WP version's own deprecation files) and functions removed in recent PHP — so the code most likely to break is no longer a blind spot.
+* [Improvement] The captured deprecation notices now refresh live — automatically when a scan completes, on page load, and via a Refresh button — instead of only on a manual page reload.
 
 = 1.2.2 =
 * [Improvement] The report now states which versions compatibility is checked against (PHP target and WordPress target), shown in the admin and the WP-CLI output. The WordPress target can be overridden via the D9URM_TARGET_WP constant or the d9urm_target_wp filter.
