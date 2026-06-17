@@ -11,7 +11,7 @@
  * Plugin Name:       Upgrade Readiness Monitor
  * Plugin URI:        https://github.com/dhanendran/upgrade-readiness-monitor
  * Description:       Know before you upgrade. Captures deprecation notices in real time (even with WP_DEBUG off) and audits your plugins and theme for PHP/WordPress compatibility in the background — with a clear readiness verdict and a WP-CLI command for CI.
- * Version:           1.2.1
+ * Version:           1.2.2
  * Author:            D9 Labs
  * Author URI:        https://d9labs.io
  * License:           GPL-2.0-or-later
@@ -26,7 +26,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	die;
 }
 
-define( 'D9URM_VERSION', '1.2.1' );
+define( 'D9URM_VERSION', '1.2.2' );
 define( 'D9URM_FILE', __FILE__ );
 define( 'D9URM_SLUG', 'upgrade-readiness-monitor' );
 
@@ -371,6 +371,7 @@ class D9_Upgrade_Readiness_Monitor {
 			'php_target'  => D9URM_TARGET_PHP,
 			'php_ok'      => version_compare( PHP_VERSION, D9URM_TARGET_PHP, '>=' ),
 			'wp_current'  => get_bloginfo( 'version' ),
+			'wp_target'   => self::wp_target(),
 			'wp_debug'    => defined( 'WP_DEBUG' ) && WP_DEBUG,
 		);
 	}
@@ -654,7 +655,7 @@ class D9_Upgrade_Readiness_Monitor {
 					$reasons[] = sprintf( /* translators: %s: date */ __( 'No update since %s (likely abandoned)', 'upgrade-readiness-monitor' ), gmdate( 'Y-m-d', $ts ) );
 				}
 			}
-			if ( ! empty( $org['tested'] ) && version_compare( $org['tested'], self::wp_major(), '<' ) ) {
+			if ( ! empty( $org['tested'] ) && version_compare( $org['tested'], self::wp_target(), '<' ) ) {
 				$status    = ( 'red' === $status ) ? 'red' : 'amber';
 				$reasons[] = sprintf( /* translators: %s: WP version */ __( 'Tested only up to WordPress %s', 'upgrade-readiness-monitor' ), $org['tested'] );
 			}
@@ -810,6 +811,22 @@ class D9_Upgrade_Readiness_Monitor {
 	private static function wp_major() {
 		$parts = explode( '.', get_bloginfo( 'version' ) );
 		return isset( $parts[1] ) ? $parts[0] . '.' . $parts[1] : $parts[0];
+	}
+
+	/**
+	 * The WordPress version compatibility is checked against.
+	 *
+	 * Defaults to the site's current major.minor. Override with the
+	 * D9URM_TARGET_WP constant or the `d9urm_target_wp` filter to check
+	 * readiness against a specific (e.g. upcoming) release.
+	 *
+	 * @since 1.2.2
+	 *
+	 * @return string
+	 */
+	private static function wp_target() {
+		$target = ( defined( 'D9URM_TARGET_WP' ) && D9URM_TARGET_WP ) ? D9URM_TARGET_WP : self::wp_major();
+		return (string) apply_filters( 'd9urm_target_wp', $target );
 	}
 
 	/**
@@ -1044,6 +1061,16 @@ class D9_Upgrade_Readiness_Monitor {
 			</table>
 
 			<h2 style="margin-top:2em;"><?php esc_html_e( 'Plugin & theme compatibility', 'upgrade-readiness-monitor' ); ?></h2>
+			<p class="description" id="d9urm-targets">
+				<?php
+				printf(
+					/* translators: 1: PHP version, 2: WordPress version */
+					esc_html__( 'Compatibility is checked against PHP %1$s and WordPress %2$s.', 'upgrade-readiness-monitor' ),
+					'<strong>' . esc_html( $env['php_target'] ) . '</strong>',
+					'<strong>' . esc_html( $env['wp_target'] ) . '</strong>'
+				);
+				?>
+			</p>
 			<p>
 				<button type="button" class="button button-primary" id="d9urm-scan"><?php esc_html_e( 'Scan now', 'upgrade-readiness-monitor' ); ?></button>
 				<span id="d9urm-scan-status" style="margin-left:10px;"></span>
@@ -1287,6 +1314,7 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 			$format = $assoc_args['format'] ?? 'table';
 
 			$env = D9_Upgrade_Readiness_Monitor::environment();
+			WP_CLI::log( sprintf( 'Checking compatibility against PHP %s and WordPress %s.', $env['php_target'], $env['wp_target'] ) );
 			WP_CLI::log( sprintf( 'PHP: %s (target %s) — %s', $env['php_current'], $env['php_target'], $env['php_ok'] ? 'OK' : 'below recommended' ) );
 			WP_CLI::log( sprintf( 'WordPress: %s', $env['wp_current'] ) );
 
