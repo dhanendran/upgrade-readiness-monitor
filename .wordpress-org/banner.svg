@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1544 500" width="1544" height="500">
+<rect width="1544" height="500" fill="#0f1b2d"/>
+<circle cx="1330" cy="70" r="360" fill="#1d3350" opacity="0.5"/>
+<circle cx="120" cy="470" r="300" fill="#13304c" opacity="0.45"/>
+<text x="96" y="172" font-family="Helvetica, Arial, sans-serif" font-size="26" font-weight="500" fill="#86efac">dhanendranrajagopal.me</text>
+<text x="92" y="262" font-family="Helvetica, Arial, sans-serif" font-size="56" font-weight="bold" fill="#ffffff">Upgrade Readiness Monitor</text>
+<rect x="96" y="292" width="120" height="6" rx="3" fill="#22c55e"/>
+<text x="96" y="356" font-family="Helvetica, Arial, sans-serif" font-size="29" fill="#cbd5e1">Know what breaks before you upgrade PHP or WordPress</text>
+<rect x="1150" y="110" width="300" height="300" rx="56" fill="#22c55e"/>
+<g transform="translate(1300,260) scale(5)"><g fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M0 -19 L16 -14 L14 5 Q12 13 0 19 Q-12 13 -14 5 L-16 -14 Z"/><polyline points="-7,-1 -2,5 9,-9"/></g></g>
+</svg>
