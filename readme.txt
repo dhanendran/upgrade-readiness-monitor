@@ -4,7 +4,7 @@ Tags: deprecation, php compatibility, upgrade, developer, site health
 Requires at least: 5.4
 Tested up to: 7.0
 Requires PHP: 7.4
-Stable tag: 1.6.1
+Stable tag: 1.6.2
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -76,6 +76,9 @@ The scan is precise rather than exhaustive: it reports problems it is confident 
 If WordPress.org can't be reached, the target-version deprecation check is simply skipped (you still get the PHP checks, metadata signals, and runtime capture). The plugin never fabricates results from missing data.
 
 == Changelog ==
+
+= 1.6.2 =
+* [Fix] Renamed the main class to the D9URM prefix for full Plugin Check naming compliance; no functional change.
 
 = 1.6.1 =
 * [Fix] Renamed the WP-CLI class to use the plugin prefix (Plugin Check naming compliance); no functional change.

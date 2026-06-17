@@ -2,7 +2,7 @@
 /**
  * Upgrade Readiness Monitor
  *
- * @package           D9_Upgrade_Readiness_Monitor
+ * @package           D9URM_Monitor
  * @author            D9 Labs
  * @copyright         2026 D9 Labs
  * @license           GPL-2.0-or-later
@@ -11,7 +11,7 @@
  * Plugin Name:       Upgrade Readiness Monitor
  * Plugin URI:        https://github.com/dhanendran/upgrade-readiness-monitor
  * Description:       Know before you upgrade. Captures deprecation notices in real time (even with WP_DEBUG off) and audits your plugins and theme for PHP/WordPress compatibility in the background — with a clear readiness verdict and a WP-CLI command for CI.
- * Version:           1.6.1
+ * Version:           1.6.2
  * Author:            D9 Labs
  * Author URI:        https://d9labs.io
  * License:           GPL-2.0-or-later
@@ -26,7 +26,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	die;
 }
 
-define( 'D9URM_VERSION', '1.6.1' );
+define( 'D9URM_VERSION', '1.6.2' );
 define( 'D9URM_FILE', __FILE__ );
 define( 'D9URM_SLUG', 'upgrade-readiness-monitor' );
 
@@ -52,7 +52,7 @@ define( 'D9URM_DEFAULT_PHP', '8.5' );              // Fallback PHP target when n
  *
  * @since 1.0.0
  */
-class D9_Upgrade_Readiness_Monitor {
+class D9URM_Monitor {
 
 	/**
 	 * Deprecation notices captured during the current request.
@@ -1904,7 +1904,7 @@ JS;
 }
 
 // Boot the plugin (no global variable kept; hooks hold the instance).
-( new D9_Upgrade_Readiness_Monitor() )->init();
+( new D9URM_Monitor() )->init();
 
 /**
  * WP-CLI command.
@@ -1946,12 +1946,12 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 		public function check( $args, $assoc_args ) {
 			$format = $assoc_args['format'] ?? 'table';
 
-			$env = D9_Upgrade_Readiness_Monitor::environment();
+			$env = D9URM_Monitor::environment();
 			WP_CLI::log( sprintf( 'Checking compatibility against PHP %s and WordPress %s.', $env['php_target'], $env['wp_target'] ) );
 			WP_CLI::log( sprintf( 'PHP: %s (target %s) — %s', $env['php_current'], $env['php_target'], $env['php_ok'] ? 'OK' : 'below recommended' ) );
 			WP_CLI::log( sprintf( 'WordPress: %s', $env['wp_current'] ) );
 
-			$rows  = D9_Upgrade_Readiness_Monitor::audit_all();
+			$rows  = D9URM_Monitor::audit_all();
 			$table = array();
 			foreach ( $rows as $row ) {
 				$table[] = array(
@@ -1969,7 +1969,7 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 			$deprecations = is_array( $log ) ? count( $log ) : 0;
 			WP_CLI::log( sprintf( '%d distinct deprecation notice(s) captured so far.', $deprecations ) );
 
-			$verdict = D9_Upgrade_Readiness_Monitor::verdict( $rows, $deprecations );
+			$verdict = D9URM_Monitor::verdict( $rows, $deprecations );
 			if ( 'red' === $verdict ) {
 				WP_CLI::error( 'Readiness: RED — issues must be resolved before upgrading.' );
 			} elseif ( 'amber' === $verdict ) {
