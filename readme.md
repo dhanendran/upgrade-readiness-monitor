@@ -4,7 +4,7 @@ Tags: deprecation, php compatibility, upgrade, developer, site health
 Requires at least: 5.4
 Tested up to: 7.0
 Requires PHP: 7.4
-Stable tag: 1.3.0
+Stable tag: 1.4.0
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -54,7 +54,15 @@ No. WordPress fires its deprecation hooks whether or not `WP_DEBUG` is enabled, 
 
 It catches deprecations that actually run, plus header/registry-based compatibility signals. As with any tool, runtime-only issues still warrant testing on staging — but you'll start every upgrade knowing far more than before.
 
+= Does the local code scan know about a higher WordPress version's deprecations? =
+
+The local scan's list of deprecated WordPress functions is built from the WordPress version currently installed, so it reflects "deprecated as of your current version." The version targets you select drive the metadata checks ("tested up to", PHP requirement). To surface deprecations introduced by a newer WordPress release specifically, run the tool on a staging copy after upgrading.
+
 == Changelog ==
+
+= 1.4.0 =
+* [Feature] Pick the version you're upgrading **to**. WordPress and PHP target selectors let you choose the version to test compatibility against; changing a target saves it and re-runs the audit. The WordPress list is fetched from WordPress.org (versions at or above your current one).
+* [Fix] The WordPress target now defaults to the **latest available** version instead of the version you're already running — so the audit reflects an actual upgrade, not the status quo.
 
 = 1.3.0 =
 * [Feature] Local code scan for plugins and themes that aren't on WordPress.org (custom/premium). Their PHP is statically scanned for deprecated WordPress functions (built from your WP version's own deprecation files) and functions removed in recent PHP — so the code most likely to break is no longer a blind spot.

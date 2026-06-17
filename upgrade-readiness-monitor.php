@@ -11,7 +11,7 @@
  * Plugin Name:       Upgrade Readiness Monitor
  * Plugin URI:        https://github.com/dhanendran/upgrade-readiness-monitor
  * Description:       Know before you upgrade. Captures deprecation notices in real time (even with WP_DEBUG off) and audits your plugins and theme for PHP/WordPress compatibility in the background — with a clear readiness verdict and a WP-CLI command for CI.
- * Version:           1.3.0
+ * Version:           1.4.0
  * Author:            D9 Labs
  * Author URI:        https://d9labs.io
  * License:           GPL-2.0-or-later
@@ -26,7 +26,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	die;
 }
 
-define( 'D9URM_VERSION', '1.3.0' );
+define( 'D9URM_VERSION', '1.4.0' );
 define( 'D9URM_FILE', __FILE__ );
 define( 'D9URM_SLUG', 'upgrade-readiness-monitor' );
 
@@ -41,10 +41,11 @@ define( 'D9URM_SCAN_CHUNK', 3 );          // Plugins audited per background tick
 define( 'D9URM_SCAN_MAX_FILES', 800 );    // Max PHP files statically scanned per non-.org item.
 define( 'D9URM_SCAN_MAX_FILESIZE', 524288 ); // Skip files larger than 512KB (likely minified/vendor).
 
-// The PHP version sites should be ready for (latest stable line).
-if ( ! defined( 'D9URM_TARGET_PHP' ) ) {
-	define( 'D9URM_TARGET_PHP', '8.5' );
-}
+define( 'D9URM_TARGETS_OPTION', 'd9urm_targets' ); // Stores the user-selected { wp, php } targets.
+define( 'D9URM_DEFAULT_PHP', '8.5' );              // Fallback PHP target when none is chosen.
+
+// D9URM_TARGET_PHP / D9URM_TARGET_WP may be defined in wp-config.php to force a
+// fixed target (highest precedence). Otherwise the UI selection / latest applies.
 
 /**
  * Core plugin class.
@@ -110,6 +111,7 @@ class D9_Upgrade_Readiness_Monitor {
 		add_action( 'wp_ajax_d9urm_scan_status', array( $this, 'ajax_scan_status' ) );
 		add_action( 'wp_ajax_d9urm_clear', array( $this, 'ajax_clear' ) );
 		add_action( 'wp_ajax_d9urm_deprecations', array( $this, 'ajax_deprecations' ) );
+		add_action( 'wp_ajax_d9urm_set_target', array( $this, 'ajax_set_target' ) );
 	}
 
 	/**
@@ -369,10 +371,11 @@ class D9_Upgrade_Readiness_Monitor {
 	 * @return array
 	 */
 	public static function environment() {
+		$php_target = self::php_target();
 		return array(
 			'php_current' => PHP_VERSION,
-			'php_target'  => D9URM_TARGET_PHP,
-			'php_ok'      => version_compare( PHP_VERSION, D9URM_TARGET_PHP, '>=' ),
+			'php_target'  => $php_target,
+			'php_ok'      => version_compare( PHP_VERSION, $php_target, '>=' ),
 			'wp_current'  => get_bloginfo( 'version' ),
 			'wp_target'   => self::wp_target(),
 			'wp_debug'    => defined( 'WP_DEBUG' ) && WP_DEBUG,
@@ -645,7 +648,7 @@ class D9_Upgrade_Readiness_Monitor {
 		$reasons = array();
 		$status  = 'green';
 
-		if ( $requires_php && version_compare( $requires_php, D9URM_TARGET_PHP, '>' ) ) {
+		if ( $requires_php && version_compare( $requires_php, self::php_target(), '>' ) ) {
 			$status    = 'red';
 			$reasons[] = sprintf( /* translators: %s: PHP version */ __( 'Requires PHP %s', 'upgrade-readiness-monitor' ), $requires_php );
 		}
@@ -850,8 +853,100 @@ class D9_Upgrade_Readiness_Monitor {
 	 * @return string
 	 */
 	private static function wp_target() {
-		$target = ( defined( 'D9URM_TARGET_WP' ) && D9URM_TARGET_WP ) ? D9URM_TARGET_WP : self::wp_major();
+		if ( defined( 'D9URM_TARGET_WP' ) && D9URM_TARGET_WP ) {
+			$target = D9URM_TARGET_WP;
+		} else {
+			$targets = get_option( D9URM_TARGETS_OPTION, array() );
+			$target  = ! empty( $targets['wp'] ) ? $targets['wp'] : self::latest_wp();
+		}
 		return (string) apply_filters( 'd9urm_target_wp', $target );
+	}
+
+	/**
+	 * The PHP version compatibility is checked against.
+	 *
+	 * Precedence: D9URM_TARGET_PHP constant > saved UI selection > default.
+	 *
+	 * @since 1.4.0
+	 *
+	 * @return string
+	 */
+	private static function php_target() {
+		if ( defined( 'D9URM_TARGET_PHP' ) && D9URM_TARGET_PHP ) {
+			$target = D9URM_TARGET_PHP;
+		} else {
+			$targets = get_option( D9URM_TARGETS_OPTION, array() );
+			$target  = ! empty( $targets['php'] ) ? $targets['php'] : D9URM_DEFAULT_PHP;
+		}
+		return (string) apply_filters( 'd9urm_target_php', $target );
+	}
+
+	/**
+	 * The latest available WordPress major.minor (for the default target).
+	 *
+	 * @since 1.4.0
+	 *
+	 * @return string
+	 */
+	private static function latest_wp() {
+		$list = self::available_wp_versions();
+		return ! empty( $list ) ? (string) end( $list ) : self::wp_major();
+	}
+
+	/**
+	 * Available WordPress major.minor versions at or above the current one,
+	 * for the upgrade-target selector. Cached; falls back to the current major.
+	 *
+	 * @since 1.4.0
+	 *
+	 * @return string[]
+	 */
+	public static function available_wp_versions() {
+		$cached = get_transient( 'd9urm_wp_versions' );
+		if ( is_array( $cached ) && ! empty( $cached ) ) {
+			return $cached;
+		}
+
+		$current = self::wp_major();
+		$list    = array();
+
+		$response = wp_remote_get( 'https://api.wordpress.org/core/stable-check/1.0/', array( 'timeout' => 8 ) );
+		if ( ! is_wp_error( $response ) && 200 === (int) wp_remote_retrieve_response_code( $response ) ) {
+			$data = json_decode( wp_remote_retrieve_body( $response ), true );
+			if ( is_array( $data ) ) {
+				$majors = array();
+				foreach ( array_keys( $data ) as $ver ) {
+					$parts = explode( '.', (string) $ver );
+					if ( count( $parts ) < 2 ) {
+						continue;
+					}
+					$mm = $parts[0] . '.' . $parts[1];
+					if ( version_compare( $mm, $current, '>=' ) ) {
+						$majors[ $mm ] = true;
+					}
+				}
+				$list = array_keys( $majors );
+				usort( $list, 'version_compare' );
+			}
+		}
+
+		if ( empty( $list ) ) {
+			$list = array( $current );
+		}
+
+		set_transient( 'd9urm_wp_versions', $list, 12 * HOUR_IN_SECONDS );
+		return $list;
+	}
+
+	/**
+	 * Selectable PHP target versions.
+	 *
+	 * @since 1.4.0
+	 *
+	 * @return string[]
+	 */
+	public static function available_php_versions() {
+		return array( '7.4', '8.0', '8.1', '8.2', '8.3', '8.4', '8.5' );
 	}
 
 	/**
@@ -1190,6 +1285,35 @@ class D9_Upgrade_Readiness_Monitor {
 	}
 
 	/**
+	 * Save the selected upgrade targets (WordPress / PHP).
+	 *
+	 * @since 1.4.0
+	 */
+	public function ajax_set_target() {
+		check_ajax_referer( 'd9urm', 'nonce' );
+		if ( ! current_user_can( 'activate_plugins' ) ) {
+			wp_send_json_error( array( 'message' => __( 'Permission denied.', 'upgrade-readiness-monitor' ) ), 403 );
+		}
+
+		$wp  = isset( $_POST['wp'] ) ? sanitize_text_field( wp_unslash( $_POST['wp'] ) ) : '';
+		$php = isset( $_POST['php'] ) ? sanitize_text_field( wp_unslash( $_POST['php'] ) ) : '';
+
+		$targets = get_option( D9URM_TARGETS_OPTION, array() );
+		if ( ! is_array( $targets ) ) {
+			$targets = array();
+		}
+		if ( in_array( $wp, self::available_wp_versions(), true ) ) {
+			$targets['wp'] = $wp;
+		}
+		if ( in_array( $php, self::available_php_versions(), true ) ) {
+			$targets['php'] = $php;
+		}
+		update_option( D9URM_TARGETS_OPTION, $targets, false );
+
+		wp_send_json_success( $targets );
+	}
+
+	/**
 	 * Build the deprecation-notices section (used on first render and refresh).
 	 *
 	 * @since 1.3.0
@@ -1330,6 +1454,18 @@ class D9_Upgrade_Readiness_Monitor {
 		// so an upgrade prompts a clean re-scan instead of showing mixed data.
 		$fresh       = isset( $results['schema'] ) && (int) $results['schema'] >= D9URM_RESULTS_SCHEMA;
 		$result_rows = $fresh ? ( $results['rows'] ?? array() ) : array();
+
+		$wp_versions  = self::available_wp_versions();
+		$php_versions = self::available_php_versions();
+		// Make sure the current targets are always selectable.
+		if ( ! in_array( $env['wp_target'], $wp_versions, true ) ) {
+			$wp_versions[] = $env['wp_target'];
+			usort( $wp_versions, 'version_compare' );
+		}
+		if ( ! in_array( $env['php_target'], $php_versions, true ) ) {
+			$php_versions[] = $env['php_target'];
+			usort( $php_versions, 'version_compare' );
+		}
 		?>
 		<div class="wrap d9urm">
 			<h1><?php esc_html_e( 'Upgrade Readiness', 'upgrade-readiness-monitor' ); ?></h1>
@@ -1357,15 +1493,21 @@ class D9_Upgrade_Readiness_Monitor {
 			</table>
 
 			<h2 style="margin-top:2em;"><?php esc_html_e( 'Plugin & theme compatibility', 'upgrade-readiness-monitor' ); ?></h2>
-			<p class="description" id="d9urm-targets">
-				<?php
-				printf(
-					/* translators: 1: PHP version, 2: WordPress version */
-					esc_html__( 'Compatibility is checked against PHP %1$s and WordPress %2$s.', 'upgrade-readiness-monitor' ),
-					'<strong>' . esc_html( $env['php_target'] ) . '</strong>',
-					'<strong>' . esc_html( $env['wp_target'] ) . '</strong>'
-				);
-				?>
+			<p class="description"><?php esc_html_e( 'Choose the versions you plan to upgrade to. Compatibility is checked against these targets:', 'upgrade-readiness-monitor' ); ?></p>
+			<p id="d9urm-targets">
+				<label for="d9urm-target-wp"><strong><?php esc_html_e( 'WordPress target:', 'upgrade-readiness-monitor' ); ?></strong></label>
+				<select id="d9urm-target-wp">
+					<?php foreach ( $wp_versions as $v ) : ?>
+						<option value="<?php echo esc_attr( $v ); ?>" <?php selected( $env['wp_target'], $v ); ?>><?php echo esc_html( $v ); ?></option>
+					<?php endforeach; ?>
+				</select>
+				&nbsp;&nbsp;
+				<label for="d9urm-target-php"><strong><?php esc_html_e( 'PHP target:', 'upgrade-readiness-monitor' ); ?></strong></label>
+				<select id="d9urm-target-php">
+					<?php foreach ( $php_versions as $v ) : ?>
+						<option value="<?php echo esc_attr( $v ); ?>" <?php selected( $env['php_target'], $v ); ?>><?php echo esc_html( $v ); ?></option>
+					<?php endforeach; ?>
+				</select>
 			</p>
 			<p>
 				<button type="button" class="button button-primary" id="d9urm-scan"><?php esc_html_e( 'Scan now', 'upgrade-readiness-monitor' ); ?></button>
@@ -1500,6 +1642,17 @@ class D9_Upgrade_Readiness_Monitor {
 		} );
 	}
 
+	function setTarget() {
+		$.post( d.ajaxUrl, {
+			action: 'd9urm_set_target',
+			nonce: d.nonce,
+			wp: $( '#d9urm-target-wp' ).val(),
+			php: $( '#d9urm-target-php' ).val()
+		} ).done( function () {
+			scan(); // Targets changed — re-run the audit against them.
+		} );
+	}
+
 	function clearLog() {
 		if ( ! window.confirm( i18n.confirm ) ) { return; }
 		$.post( d.ajaxUrl, { action: 'd9urm_clear', nonce: d.nonce } ).done( function () {
@@ -1509,6 +1662,7 @@ class D9_Upgrade_Readiness_Monitor {
 
 	$( function () {
 		$( '#d9urm-scan' ).on( 'click', scan );
+		$( '#d9urm-target-wp, #d9urm-target-php' ).on( 'change', setTarget );
 		$( document ).on( 'click', '#d9urm-clear', clearLog );
 		$( document ).on( 'click', '#d9urm-refresh-dep', refreshDeprecations );
 
@@ -1541,6 +1695,9 @@ JS;
 		delete_option( D9URM_LOG_OPTION );
 		delete_option( D9URM_RESULTS_OPTION );
 		delete_option( D9URM_STATE_OPTION );
+		delete_option( D9URM_TARGETS_OPTION );
+		delete_transient( 'd9urm_wp_versions' );
+		delete_transient( 'd9urm_wp_deprecated' );
 		wp_clear_scheduled_hook( 'd9urm_weekly_scan' );
 		wp_clear_scheduled_hook( 'd9urm_run_scan_chunk' );
 		$wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient_d9urm_org%' OR option_name LIKE '_transient_timeout_d9urm_org%'" ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
