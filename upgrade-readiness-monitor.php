@@ -10,14 +10,14 @@
  * @wordpress-plugin
  * Plugin Name:       Upgrade Readiness Monitor
  * Plugin URI:        https://github.com/dhanendran/upgrade-readiness-monitor
- * Description:       Know before you upgrade. Captures deprecation notices in real time (even with WP_DEBUG off) and audits your plugins and theme for PHP/WordPress compatibility, abandoned code, and available updates — with a clear readiness verdict and a WP-CLI command for CI.
- * Version:           1.0.0
+ * Description:       Know before you upgrade. Captures deprecation notices in real time (even with WP_DEBUG off) and audits your plugins and theme for PHP/WordPress compatibility in the background — with a clear readiness verdict and a WP-CLI command for CI.
+ * Version:           1.1.0
  * Author:            D9 Labs
  * Author URI:        https://d9labs.io
  * License:           GPL-2.0-or-later
  * License URI:       https://www.gnu.org/licenses/gpl-2.0.html
  * Text Domain:       upgrade-readiness-monitor
- * Requires at least: 5.2
+ * Requires at least: 5.4
  * Requires PHP:      7.4
  */
 
@@ -26,11 +26,17 @@ if ( ! defined( 'ABSPATH' ) ) {
 	die;
 }
 
-define( 'D9URM_VERSION', '1.0.0' );
+define( 'D9URM_VERSION', '1.1.0' );
 define( 'D9URM_FILE', __FILE__ );
 define( 'D9URM_SLUG', 'upgrade-readiness-monitor' );
+
 define( 'D9URM_LOG_OPTION', 'd9urm_deprecation_log' );
-define( 'D9URM_LOG_CAP', 300 );
+define( 'D9URM_RESULTS_OPTION', 'd9urm_scan_results' );
+define( 'D9URM_STATE_OPTION', 'd9urm_scan_state' );
+
+define( 'D9URM_LOG_CAP', 300 );          // Max distinct deprecation notices stored.
+define( 'D9URM_CAPTURE_PER_REQUEST', 25 ); // Max new captures per request (perf guard).
+define( 'D9URM_SCAN_CHUNK', 3 );          // Plugins audited per background tick.
 
 // The PHP version sites should be ready for (latest stable line).
 if ( ! defined( 'D9URM_TARGET_PHP' ) ) {
@@ -52,11 +58,11 @@ class D9_Upgrade_Readiness_Monitor {
 	private $captured = array();
 
 	/**
-	 * Whether anything new was captured this request (persist on shutdown).
+	 * How many notices we've captured this request (perf guard).
 	 *
-	 * @var bool
+	 * @var int
 	 */
-	private $dirty = false;
+	private $capture_count = 0;
 
 	/**
 	 * Boot the plugin.
@@ -64,37 +70,84 @@ class D9_Upgrade_Readiness_Monitor {
 	 * @since 1.0.0
 	 */
 	public function init() {
+		register_activation_hook( D9URM_FILE, array( $this, 'activate' ) );
+		register_deactivation_hook( D9URM_FILE, array( $this, 'deactivate' ) );
 		register_uninstall_hook( D9URM_FILE, array( __CLASS__, 'uninstall' ) );
 
-		// Real-time deprecation capture. These actions fire regardless of
-		// WP_DEBUG, so this works on production too.
-		add_action( 'deprecated_function_run', array( $this, 'on_deprecated_function' ), 10, 3 );
-		add_action( 'deprecated_argument_run', array( $this, 'on_deprecated_argument' ), 10, 3 );
-		add_action( 'deprecated_hook_run', array( $this, 'on_deprecated_hook' ), 10, 4 );
-		add_action( 'deprecated_file_included', array( $this, 'on_deprecated_file' ), 10, 4 );
-		add_action( 'deprecated_constructor_run', array( $this, 'on_deprecated_constructor' ), 10, 3 );
-		add_action( 'doing_it_wrong_run', array( $this, 'on_doing_it_wrong' ), 10, 3 );
-		add_action( 'shutdown', array( $this, 'persist' ) );
+		// Real-time deprecation capture (fires regardless of WP_DEBUG).
+		if ( $this->capture_enabled() ) {
+			add_action( 'deprecated_function_run', array( $this, 'on_deprecated_function' ), 10, 3 );
+			add_action( 'deprecated_argument_run', array( $this, 'on_deprecated_argument' ), 10, 3 );
+			add_action( 'deprecated_hook_run', array( $this, 'on_deprecated_hook' ), 10, 4 );
+			add_action( 'deprecated_file_included', array( $this, 'on_deprecated_file' ), 10, 4 );
+			add_action( 'deprecated_constructor_run', array( $this, 'on_deprecated_constructor' ), 10, 3 );
+			add_action( 'doing_it_wrong_run', array( $this, 'on_doing_it_wrong' ), 10, 3 );
+			add_action( 'shutdown', array( $this, 'persist' ) );
+		}
+
+		// Background audit (WP-Cron).
+		add_action( 'd9urm_run_scan_chunk', array( $this, 'run_scan_chunk' ) );
+		add_action( 'd9urm_weekly_scan', array( $this, 'start_scan' ) );
 
 		// Admin UI.
 		add_action( 'admin_menu', array( $this, 'add_menu' ) );
 		add_action( 'admin_enqueue_scripts', array( $this, 'enqueue' ) );
 		add_filter( 'plugin_action_links_' . plugin_basename( D9URM_FILE ), array( $this, 'action_links' ) );
 
-		// AJAX.
-		add_action( 'wp_ajax_d9urm_scan', array( $this, 'ajax_scan' ) );
+		// AJAX (lightweight: start a background scan, poll status, clear log).
+		add_action( 'wp_ajax_d9urm_start_scan', array( $this, 'ajax_start_scan' ) );
+		add_action( 'wp_ajax_d9urm_scan_status', array( $this, 'ajax_scan_status' ) );
 		add_action( 'wp_ajax_d9urm_clear', array( $this, 'ajax_clear' ) );
 	}
 
+	/**
+	 * Whether deprecation capture is enabled.
+	 *
+	 * @since 1.1.0
+	 *
+	 * @return bool
+	 */
+	private function capture_enabled() {
+		if ( defined( 'D9URM_DISABLE_CAPTURE' ) && D9URM_DISABLE_CAPTURE ) {
+			return false;
+		}
+		return (bool) apply_filters( 'd9urm_capture_enabled', true );
+	}
+
 	/* ---------------------------------------------------------------------
-	 * Deprecation capture
+	 * Activation / scheduling
+	 * ------------------------------------------------------------------- */
+
+	/**
+	 * Schedule the weekly background scan on activation.
+	 *
+	 * @since 1.1.0
+	 */
+	public function activate() {
+		if ( ! wp_next_scheduled( 'd9urm_weekly_scan' ) ) {
+			wp_schedule_event( time() + 60, 'weekly', 'd9urm_weekly_scan' );
+		}
+	}
+
+	/**
+	 * Clear scheduled events on deactivation.
+	 *
+	 * @since 1.1.0
+	 */
+	public function deactivate() {
+		wp_clear_scheduled_hook( 'd9urm_weekly_scan' );
+		wp_clear_scheduled_hook( 'd9urm_run_scan_chunk' );
+	}
+
+	/* ---------------------------------------------------------------------
+	 * Deprecation capture (cheap + bounded)
 	 * ------------------------------------------------------------------- */
 
 	/**
 	 * @since 1.0.0
 	 * @param string $function    Deprecated function.
-	 * @param string $replacement Suggested replacement.
-	 * @param string $version     Version deprecated.
+	 * @param string $replacement Replacement.
+	 * @param string $version     Version.
 	 */
 	public function on_deprecated_function( $function, $replacement, $version ) {
 		$this->record( 'function', $function, $replacement, $version );
@@ -118,7 +171,7 @@ class D9_Upgrade_Readiness_Monitor {
 	 * @param string $message     Message.
 	 */
 	public function on_deprecated_hook( $hook, $replacement, $version, $message ) {
-		$this->record( 'hook', $hook, trim( $replacement . ' ' . (string) $message ), $version );
+		$this->record( 'hook', $hook, trim( (string) $replacement . ' ' . (string) $message ), $version );
 	}
 
 	/**
@@ -129,12 +182,12 @@ class D9_Upgrade_Readiness_Monitor {
 	 * @param string $message     Message.
 	 */
 	public function on_deprecated_file( $file, $replacement, $version, $message ) {
-		$this->record( 'file', $file, trim( $replacement . ' ' . (string) $message ), $version );
+		$this->record( 'file', $file, trim( (string) $replacement . ' ' . (string) $message ), $version );
 	}
 
 	/**
 	 * @since 1.0.0
-	 * @param string $class   Class name.
+	 * @param string $class   Class.
 	 * @param string $version Version.
 	 * @param string $parent  Parent class.
 	 */
@@ -153,7 +206,7 @@ class D9_Upgrade_Readiness_Monitor {
 	}
 
 	/**
-	 * Record a single notice in memory, attributing it to its source.
+	 * Record a notice in memory (bounded), attributing it to its source.
 	 *
 	 * @since 1.0.0
 	 *
@@ -163,28 +216,35 @@ class D9_Upgrade_Readiness_Monitor {
 	 * @param string $version Version.
 	 */
 	private function record( $type, $label, $message, $version ) {
+		// Per-request perf guard: stop after a cap so a deprecated call inside
+		// a big loop can never spiral CPU/memory.
+		if ( $this->capture_count >= D9URM_CAPTURE_PER_REQUEST ) {
+			return;
+		}
+
 		$source = $this->guess_source();
 		$key    = md5( $type . '|' . $label . '|' . $version . '|' . $source['slug'] );
 
 		if ( isset( $this->captured[ $key ] ) ) {
 			$this->captured[ $key ]['count']++;
-		} else {
-			$this->captured[ $key ] = array(
-				'type'        => $type,
-				'label'       => (string) $label,
-				'message'     => $message,
-				'version'     => (string) $version,
-				'source_slug' => $source['slug'],
-				'source_name' => $source['name'],
-				'source_type' => $source['type'],
-				'count'       => 1,
-			);
+			return;
 		}
-		$this->dirty = true;
+
+		$this->capture_count++;
+		$this->captured[ $key ] = array(
+			'type'        => $type,
+			'label'       => (string) $label,
+			'message'     => (string) $message,
+			'version'     => (string) $version,
+			'source_slug' => $source['slug'],
+			'source_name' => $source['name'],
+			'source_type' => $source['type'],
+			'count'       => 1,
+		);
 	}
 
 	/**
-	 * Walk the backtrace to attribute a notice to a plugin or theme.
+	 * Walk a frame-limited backtrace to attribute a notice to a plugin/theme.
 	 *
 	 * @since 1.0.0
 	 *
@@ -197,14 +257,9 @@ class D9_Upgrade_Readiness_Monitor {
 			'type' => 'unknown',
 		);
 
-		if ( ! function_exists( 'debug_backtrace' ) ) {
-			return $unknown;
-		}
-
-		$frames    = debug_backtrace( DEBUG_BACKTRACE_IGNORE_ARGS ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_debug_backtrace
-		$self_dir  = wp_normalize_path( plugin_dir_path( D9URM_FILE ) );
-		$plugin_re = '#/wp-content/(?:mu-plugins|plugins)/([^/]+)#';
-		$theme_re  = '#/wp-content/themes/([^/]+)#';
+		// Frame-limited + args ignored: cheap and bounded.
+		$frames   = debug_backtrace( DEBUG_BACKTRACE_IGNORE_ARGS, 20 ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_debug_backtrace
+		$self_dir = wp_normalize_path( plugin_dir_path( D9URM_FILE ) );
 
 		foreach ( $frames as $frame ) {
 			if ( empty( $frame['file'] ) ) {
@@ -212,19 +267,18 @@ class D9_Upgrade_Readiness_Monitor {
 			}
 			$file = wp_normalize_path( $frame['file'] );
 
-			// Skip our own plugin and WordPress core files.
 			if ( 0 === strpos( $file, $self_dir ) || false !== strpos( $file, '/wp-includes/' ) || false !== strpos( $file, '/wp-admin/' ) ) {
 				continue;
 			}
 
-			if ( preg_match( $plugin_re, $file, $m ) ) {
+			if ( preg_match( '#/wp-content/(?:mu-plugins|plugins)/([^/]+)#', $file, $m ) ) {
 				return array(
 					'slug' => $m[1],
 					'name' => $m[1],
 					'type' => 'plugin',
 				);
 			}
-			if ( preg_match( $theme_re, $file, $m ) ) {
+			if ( preg_match( '#/wp-content/themes/([^/]+)#', $file, $m ) ) {
 				return array(
 					'slug' => $m[1],
 					'name' => $m[1],
@@ -237,12 +291,13 @@ class D9_Upgrade_Readiness_Monitor {
 	}
 
 	/**
-	 * Persist newly captured notices on shutdown (only if something changed).
+	 * Persist on shutdown — but only when a NEW signature appears, so there
+	 * are no database writes once a site's deprecations are known.
 	 *
 	 * @since 1.0.0
 	 */
 	public function persist() {
-		if ( ! $this->dirty || empty( $this->captured ) ) {
+		if ( empty( $this->captured ) ) {
 			return;
 		}
 
@@ -251,24 +306,28 @@ class D9_Upgrade_Readiness_Monitor {
 			$log = array();
 		}
 
-		$now = time();
+		$now   = time();
+		$added = false;
+
 		foreach ( $this->captured as $key => $entry ) {
 			if ( isset( $log[ $key ] ) ) {
-				$log[ $key ]['count']    += $entry['count'];
-				$log[ $key ]['last_seen'] = $now;
-			} else {
-				$entry['first_seen'] = $now;
-				$entry['last_seen']  = $now;
-				$log[ $key ]         = $entry;
+				continue; // Already known — skip to avoid steady-state writes.
 			}
+			$entry['first_seen'] = $now;
+			$entry['last_seen']  = $now;
+			$log[ $key ]         = $entry;
+			$added               = true;
 		}
 
-		// Cap the log; drop the least-recently-seen entries first.
+		if ( ! $added ) {
+			return;
+		}
+
 		if ( count( $log ) > D9URM_LOG_CAP ) {
 			uasort(
 				$log,
 				static function ( $a, $b ) {
-					return $b['last_seen'] <=> $a['last_seen'];
+					return ( $b['last_seen'] ?? 0 ) <=> ( $a['last_seen'] ?? 0 );
 				}
 			);
 			$log = array_slice( $log, 0, D9URM_LOG_CAP, true );
@@ -278,7 +337,7 @@ class D9_Upgrade_Readiness_Monitor {
 	}
 
 	/* ---------------------------------------------------------------------
-	 * Audit engine (shared by admin AJAX and WP-CLI)
+	 * Background audit engine
 	 * ------------------------------------------------------------------- */
 
 	/**
@@ -290,16 +349,139 @@ class D9_Upgrade_Readiness_Monitor {
 	 */
 	public static function environment() {
 		return array(
-			'php_current'    => PHP_VERSION,
-			'php_target'     => D9URM_TARGET_PHP,
-			'php_ok'         => version_compare( PHP_VERSION, D9URM_TARGET_PHP, '>=' ),
-			'wp_current'     => get_bloginfo( 'version' ),
-			'wp_debug'       => defined( 'WP_DEBUG' ) && WP_DEBUG,
+			'php_current' => PHP_VERSION,
+			'php_target'  => D9URM_TARGET_PHP,
+			'php_ok'      => version_compare( PHP_VERSION, D9URM_TARGET_PHP, '>=' ),
+			'wp_current'  => get_bloginfo( 'version' ),
+			'wp_debug'    => defined( 'WP_DEBUG' ) && WP_DEBUG,
 		);
 	}
 
 	/**
-	 * Fetch (and cache) wordpress.org metadata for a plugin slug.
+	 * Start (or restart) a background scan.
+	 *
+	 * @since 1.1.0
+	 */
+	public function start_scan() {
+		if ( ! function_exists( 'get_plugins' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/plugin.php';
+		}
+
+		$state = get_option( D9URM_STATE_OPTION, array() );
+		// Don't stack scans; allow restart if a previous run stalled (>10 min).
+		if ( ! empty( $state['running'] ) && isset( $state['updated'] ) && ( time() - $state['updated'] ) < 600 ) {
+			return;
+		}
+
+		$total = count( get_plugins() );
+		update_option(
+			D9URM_STATE_OPTION,
+			array(
+				'running' => true,
+				'offset'  => 0,
+				'total'   => $total,
+				'started' => time(),
+				'updated' => time(),
+				'rows'    => array(),
+			),
+			false
+		);
+
+		$this->schedule_chunk();
+	}
+
+	/**
+	 * Schedule the next background chunk and nudge cron.
+	 *
+	 * @since 1.1.0
+	 */
+	private function schedule_chunk() {
+		if ( ! wp_next_scheduled( 'd9urm_run_scan_chunk' ) ) {
+			wp_schedule_single_event( time(), 'd9urm_run_scan_chunk' );
+		}
+		if ( function_exists( 'spawn_cron' ) ) {
+			spawn_cron();
+		}
+	}
+
+	/**
+	 * Process one small chunk of plugins in the background, then reschedule.
+	 *
+	 * Each chunk runs in its own request and audits only D9URM_SCAN_CHUNK
+	 * plugins, so memory stays low regardless of how many plugins exist.
+	 *
+	 * @since 1.1.0
+	 */
+	public function run_scan_chunk() {
+		if ( ! function_exists( 'get_plugins' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/plugin.php';
+		}
+
+		$state = get_option( D9URM_STATE_OPTION, array() );
+		if ( empty( $state['running'] ) ) {
+			return;
+		}
+
+		$all    = get_plugins();
+		$files  = array_keys( $all );
+		$offset = (int) $state['offset'];
+		$slice  = array_slice( $files, $offset, D9URM_SCAN_CHUNK );
+
+		foreach ( $slice as $file ) {
+			$state['rows'][] = self::audit_plugin( $file, $all[ $file ] );
+		}
+
+		$offset          += count( $slice );
+		$state['offset']  = $offset;
+		$state['updated'] = time();
+
+		if ( $offset < $state['total'] && ! empty( $slice ) ) {
+			update_option( D9URM_STATE_OPTION, $state, false );
+			$this->schedule_chunk();
+			return;
+		}
+
+		// Finished — store final results, mark idle.
+		$rows = $state['rows'];
+		update_option(
+			D9URM_RESULTS_OPTION,
+			array(
+				'rows'         => $rows,
+				'completed_at' => time(),
+				'environment'  => self::environment(),
+				'verdict'      => self::verdict( $rows, $this->deprecation_count() ),
+			),
+			false
+		);
+		update_option(
+			D9URM_STATE_OPTION,
+			array(
+				'running' => false,
+				'offset'  => $offset,
+				'total'   => $state['total'],
+				'updated' => time(),
+			),
+			false
+		);
+	}
+
+	/**
+	 * Number of distinct captured deprecation notices.
+	 *
+	 * @since 1.1.0
+	 *
+	 * @return int
+	 */
+	private function deprecation_count() {
+		$log = get_option( D9URM_LOG_OPTION, array() );
+		return is_array( $log ) ? count( $log ) : 0;
+	}
+
+	/**
+	 * Fetch (and cache) minimal wordpress.org metadata for a plugin slug.
+	 *
+	 * Uses plugins_api() with sections/reviews/etc. disabled, so the payload
+	 * is a few fields rather than the full (potentially multi-MB) plugin page.
 	 *
 	 * @since 1.0.0
 	 *
@@ -318,37 +500,60 @@ class D9_Upgrade_Readiness_Monitor {
 			return is_array( $cached ) ? $cached : null;
 		}
 
-		$response = wp_remote_get(
-			'https://api.wordpress.org/plugins/info/1.2/?action=plugin_information&request[slug]=' . rawurlencode( $slug ),
-			array( 'timeout' => 8 )
+		if ( ! function_exists( 'plugins_api' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/plugin-install.php';
+		}
+
+		$response = plugins_api(
+			'plugin_information',
+			array(
+				'slug'   => $slug,
+				'fields' => array(
+					// Only what we need; everything heavy is disabled.
+					'last_updated'      => true,
+					'tested'            => true,
+					'requires'          => true,
+					'requires_php'      => true,
+					'version'           => true,
+					'sections'          => false,
+					'description'       => false,
+					'short_description' => false,
+					'screenshots'       => false,
+					'reviews'           => false,
+					'banners'           => false,
+					'icons'             => false,
+					'versions'          => false,
+					'contributors'      => false,
+					'tags'              => false,
+					'ratings'           => false,
+					'support_threads'   => false,
+				),
+			)
 		);
 
 		$info = null;
-		if ( ! is_wp_error( $response ) && 200 === (int) wp_remote_retrieve_response_code( $response ) ) {
-			$body = json_decode( wp_remote_retrieve_body( $response ), true );
-			if ( is_array( $body ) && empty( $body['error'] ) ) {
-				$info = array(
-					'last_updated' => isset( $body['last_updated'] ) ? $body['last_updated'] : '',
-					'tested'       => isset( $body['tested'] ) ? $body['tested'] : '',
-					'requires_php' => isset( $body['requires_php'] ) ? $body['requires_php'] : '',
-					'version'      => isset( $body['version'] ) ? $body['version'] : '',
-				);
-			}
+		if ( ! is_wp_error( $response ) && is_object( $response ) ) {
+			$info = array(
+				'last_updated' => isset( $response->last_updated ) ? $response->last_updated : '',
+				'tested'       => isset( $response->tested ) ? $response->tested : '',
+				'requires_php' => isset( $response->requires_php ) ? $response->requires_php : '',
+				'version'      => isset( $response->version ) ? $response->version : '',
+			);
 		}
 
-		// Cache positive results for 12h, "not found" for 6h to limit lookups.
-		set_transient( $cache_key, null === $info ? 'none' : $info, null === $info ? 6 * HOUR_IN_SECONDS : 12 * HOUR_IN_SECONDS );
+		// Cache hits for 12h; "not found" (custom/premium) for 6h.
+		set_transient( $cache_key, null === $info ? 'none' : $info, ( null === $info ? 6 : 12 ) * HOUR_IN_SECONDS );
 
 		return $info;
 	}
 
 	/**
-	 * Audit a single plugin and return a row with a status.
+	 * Audit a single plugin.
 	 *
 	 * @since 1.0.0
 	 *
 	 * @param string $file Plugin file (basename).
-	 * @param array  $data Plugin header data from get_plugins().
+	 * @param array  $data Plugin header data.
 	 * @return array
 	 */
 	public static function audit_plugin( $file, $data ) {
@@ -359,40 +564,35 @@ class D9_Upgrade_Readiness_Monitor {
 		$reasons      = array();
 		$status       = 'green';
 
-		// Header-declared PHP requirement that exceeds the target line.
 		if ( $requires_php && version_compare( $requires_php, D9URM_TARGET_PHP, '>' ) ) {
 			$status    = 'red';
-			$reasons[] = sprintf( /* translators: %s php version */ __( 'Requires PHP %s', 'upgrade-readiness-monitor' ), $requires_php );
+			$reasons[] = sprintf( /* translators: %s: PHP version */ __( 'Requires PHP %s', 'upgrade-readiness-monitor' ), $requires_php );
 		}
 
-		$last_updated = $org['last_updated'] ?? '';
-		$tested       = $org['tested'] ?? '';
-		$latest       = $org['version'] ?? '';
-
 		if ( null === $org ) {
-			// Not found on wordpress.org (custom/premium) — can't verify.
 			$status    = ( 'red' === $status ) ? 'red' : 'amber';
 			$reasons[] = __( 'Not on WordPress.org — cannot verify; test manually.', 'upgrade-readiness-monitor' );
 		} else {
-			// Abandoned: no update in 2+ years.
+			$last_updated = $org['last_updated'];
+			$tested       = $org['tested'];
+			$latest       = $org['version'];
+
 			if ( $last_updated ) {
 				$ts = strtotime( $last_updated );
 				if ( $ts && $ts < strtotime( '-2 years' ) ) {
 					$status    = 'red';
-					$reasons[] = sprintf( /* translators: %s date */ __( 'No update since %s (likely abandoned)', 'upgrade-readiness-monitor' ), gmdate( 'Y-m-d', $ts ) );
+					$reasons[] = sprintf( /* translators: %s: date */ __( 'No update since %s (likely abandoned)', 'upgrade-readiness-monitor' ), gmdate( 'Y-m-d', $ts ) );
 				}
 			}
-			// Tested-up-to behind the current WP major.
 			if ( $tested && version_compare( $tested, self::wp_major(), '<' ) ) {
 				$status    = ( 'red' === $status ) ? 'red' : 'amber';
-				$reasons[] = sprintf( /* translators: %s wp version */ __( 'Tested only up to WordPress %s', 'upgrade-readiness-monitor' ), $tested );
+				$reasons[] = sprintf( /* translators: %s: WP version */ __( 'Tested only up to WordPress %s', 'upgrade-readiness-monitor' ), $tested );
 			}
-			// Update available.
 			if ( $latest && version_compare( $latest, (string) ( $data['Version'] ?? '0' ), '>' ) ) {
 				if ( 'green' === $status ) {
 					$status = 'amber';
 				}
-				$reasons[] = sprintf( /* translators: %s version */ __( 'Update available (%s)', 'upgrade-readiness-monitor' ), $latest );
+				$reasons[] = sprintf( /* translators: %s: version */ __( 'Update available (%s)', 'upgrade-readiness-monitor' ), $latest );
 			}
 		}
 
@@ -401,17 +601,17 @@ class D9_Upgrade_Readiness_Monitor {
 		}
 
 		return array(
-			'slug'     => $slug,
-			'name'     => $data['Name'] ?? $slug,
-			'version'  => $data['Version'] ?? '',
-			'active'   => is_plugin_active( $file ),
-			'status'   => $status,
-			'reasons'  => $reasons,
+			'slug'    => $slug,
+			'name'    => $data['Name'] ?? $slug,
+			'version' => $data['Version'] ?? '',
+			'active'  => is_plugin_active( $file ),
+			'status'  => $status,
+			'reasons' => $reasons,
 		);
 	}
 
 	/**
-	 * Current WordPress major.minor (e.g. "7.0").
+	 * Current WordPress major.minor.
 	 *
 	 * @since 1.0.0
 	 *
@@ -423,47 +623,32 @@ class D9_Upgrade_Readiness_Monitor {
 	}
 
 	/**
-	 * Audit every installed plugin.
+	 * Synchronous full audit (WP-CLI only — devs accept the runtime, and the
+	 * field-restricted API keeps memory low).
 	 *
 	 * @since 1.0.0
 	 *
-	 * @param int $offset Offset for batching.
-	 * @param int $limit  Limit for batching (0 = all).
-	 * @return array { rows, total, offset, limit }
+	 * @return array
 	 */
-	public static function audit_plugins( $offset = 0, $limit = 0 ) {
+	public static function audit_all() {
 		if ( ! function_exists( 'get_plugins' ) ) {
 			require_once ABSPATH . 'wp-admin/includes/plugin.php';
 		}
-
-		$all   = get_plugins();
-		$files = array_keys( $all );
-		$total = count( $files );
-
-		if ( $limit > 0 ) {
-			$files = array_slice( $files, $offset, $limit );
-		}
-
+		$all  = get_plugins();
 		$rows = array();
-		foreach ( $files as $file ) {
-			$rows[] = self::audit_plugin( $file, $all[ $file ] );
+		foreach ( $all as $file => $data ) {
+			$rows[] = self::audit_plugin( $file, $data );
 		}
-
-		return array(
-			'rows'   => $rows,
-			'total'  => $total,
-			'offset' => $offset,
-			'limit'  => $limit,
-		);
+		return $rows;
 	}
 
 	/**
-	 * Compute an overall verdict from audit rows + the deprecation log.
+	 * Compute an overall verdict.
 	 *
 	 * @since 1.0.0
 	 *
-	 * @param array $rows Plugin audit rows.
-	 * @param int   $deprecations Number of distinct deprecation notices.
+	 * @param array $rows         Audit rows.
+	 * @param int   $deprecations Distinct deprecation notices.
 	 * @return string green|amber|red
 	 */
 	public static function verdict( $rows, $deprecations ) {
@@ -486,24 +671,39 @@ class D9_Upgrade_Readiness_Monitor {
 	}
 
 	/* ---------------------------------------------------------------------
-	 * AJAX
+	 * AJAX (lightweight only)
 	 * ------------------------------------------------------------------- */
 
 	/**
-	 * Scan a batch of plugins.
+	 * Kick off a background scan.
 	 *
-	 * @since 1.0.0
+	 * @since 1.1.0
 	 */
-	public function ajax_scan() {
+	public function ajax_start_scan() {
 		check_ajax_referer( 'd9urm', 'nonce' );
 		if ( ! current_user_can( 'activate_plugins' ) ) {
 			wp_send_json_error( array( 'message' => __( 'Permission denied.', 'upgrade-readiness-monitor' ) ), 403 );
 		}
+		$this->start_scan();
+		wp_send_json_success( get_option( D9URM_STATE_OPTION, array() ) );
+	}
 
-		$offset = isset( $_POST['offset'] ) ? absint( $_POST['offset'] ) : 0;
-		$limit  = isset( $_POST['limit'] ) ? max( 1, absint( $_POST['limit'] ) ) : 5;
-
-		wp_send_json_success( self::audit_plugins( $offset, $limit ) );
+	/**
+	 * Return scan progress + results (for polling).
+	 *
+	 * @since 1.1.0
+	 */
+	public function ajax_scan_status() {
+		check_ajax_referer( 'd9urm', 'nonce' );
+		if ( ! current_user_can( 'activate_plugins' ) ) {
+			wp_send_json_error( array( 'message' => __( 'Permission denied.', 'upgrade-readiness-monitor' ) ), 403 );
+		}
+		wp_send_json_success(
+			array(
+				'state'   => get_option( D9URM_STATE_OPTION, array() ),
+				'results' => get_option( D9URM_RESULTS_OPTION, array() ),
+			)
+		);
 	}
 
 	/**
@@ -516,7 +716,6 @@ class D9_Upgrade_Readiness_Monitor {
 		if ( ! current_user_can( 'activate_plugins' ) ) {
 			wp_send_json_error( array( 'message' => __( 'Permission denied.', 'upgrade-readiness-monitor' ) ), 403 );
 		}
-
 		delete_option( D9URM_LOG_OPTION );
 		wp_send_json_success();
 	}
@@ -524,6 +723,24 @@ class D9_Upgrade_Readiness_Monitor {
 	/* ---------------------------------------------------------------------
 	 * Admin UI
 	 * ------------------------------------------------------------------- */
+
+	/**
+	 * Quick-access link on the Plugins list row.
+	 *
+	 * @since 1.0.0
+	 *
+	 * @param array $links Action links.
+	 * @return array
+	 */
+	public function action_links( $links ) {
+		$link = sprintf(
+			'<a href="%s">%s</a>',
+			esc_url( admin_url( 'tools.php?page=' . D9URM_SLUG ) ),
+			esc_html__( 'View report', 'upgrade-readiness-monitor' )
+		);
+		array_unshift( $links, $link );
+		return $links;
+	}
 
 	/**
 	 * Register the Tools submenu.
@@ -538,25 +755,6 @@ class D9_Upgrade_Readiness_Monitor {
 			D9URM_SLUG,
 			array( $this, 'render_page' )
 		);
-	}
-
-	/**
-	 * Add a quick-access link to the report on the Plugins list row.
-	 *
-	 * @since 1.0.0
-	 *
-	 * @param array $links Existing action links.
-	 * @return array
-	 */
-	public function action_links( $links ) {
-		$link = sprintf(
-			'<a href="%s">%s</a>',
-			esc_url( admin_url( 'tools.php?page=' . D9URM_SLUG ) ),
-			esc_html__( 'View report', 'upgrade-readiness-monitor' )
-		);
-		array_unshift( $links, $link );
-
-		return $links;
 	}
 
 	/**
@@ -576,15 +774,14 @@ class D9_Upgrade_Readiness_Monitor {
 			'jquery',
 			'd9urmData',
 			array(
-				'ajaxUrl'   => admin_url( 'admin-ajax.php' ),
-				'nonce'     => wp_create_nonce( 'd9urm' ),
-				'batchSize' => 5,
-				'i18n'      => array(
-					'scanning'  => esc_html__( 'Scanning…', 'upgrade-readiness-monitor' ),
-					'scan'      => esc_html__( 'Scan plugins', 'upgrade-readiness-monitor' ),
-					'error'     => esc_html__( 'Scan failed. Please try again.', 'upgrade-readiness-monitor' ),
-					'cleared'   => esc_html__( 'Deprecation log cleared.', 'upgrade-readiness-monitor' ),
-					'confirm'   => esc_html__( 'Clear all captured deprecation notices?', 'upgrade-readiness-monitor' ),
+				'ajaxUrl' => admin_url( 'admin-ajax.php' ),
+				'nonce'   => wp_create_nonce( 'd9urm' ),
+				'i18n'    => array(
+					'scanning' => esc_html__( 'Scanning in the background…', 'upgrade-readiness-monitor' ),
+					'scan'     => esc_html__( 'Scan plugins now', 'upgrade-readiness-monitor' ),
+					'error'    => esc_html__( 'Could not start the scan. Please try again.', 'upgrade-readiness-monitor' ),
+					'confirm'  => esc_html__( 'Clear all captured deprecation notices?', 'upgrade-readiness-monitor' ),
+					'done'     => esc_html__( 'Scan complete.', 'upgrade-readiness-monitor' ),
 				),
 			)
 		);
@@ -592,7 +789,7 @@ class D9_Upgrade_Readiness_Monitor {
 
 		wp_register_style( 'd9urm', false, array(), D9URM_VERSION );
 		wp_enqueue_style( 'd9urm' );
-		wp_add_inline_style( 'd9urm', $this->inline_css() );
+		wp_add_inline_style( 'd9urm', '.d9urm-pill{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;color:#fff;vertical-align:middle;}.d9urm-green{background:#00a32a;}.d9urm-amber{background:#dba617;}.d9urm-red{background:#d63638;}' );
 	}
 
 	/**
@@ -605,11 +802,10 @@ class D9_Upgrade_Readiness_Monitor {
 			wp_die( esc_html__( 'You do not have permission to access this page.', 'upgrade-readiness-monitor' ) );
 		}
 
-		$env = self::environment();
-		$log = get_option( D9URM_LOG_OPTION, array() );
-		$log = is_array( $log ) ? $log : array();
-
-		// Sort the log by most-recently-seen.
+		$env     = self::environment();
+		$results = get_option( D9URM_RESULTS_OPTION, array() );
+		$log     = get_option( D9URM_LOG_OPTION, array() );
+		$log     = is_array( $log ) ? $log : array();
 		uasort(
 			$log,
 			static function ( $a, $b ) {
@@ -620,7 +816,7 @@ class D9_Upgrade_Readiness_Monitor {
 		<div class="wrap d9urm">
 			<h1><?php esc_html_e( 'Upgrade Readiness', 'upgrade-readiness-monitor' ); ?></h1>
 			<p class="description">
-				<?php esc_html_e( 'See what will break before you upgrade PHP or WordPress. Deprecation notices are captured automatically as your site runs (even with WP_DEBUG off).', 'upgrade-readiness-monitor' ); ?>
+				<?php esc_html_e( 'See what will break before you upgrade PHP or WordPress. Deprecations are captured automatically as your site runs; the plugin audit runs in the background so it never slows your site.', 'upgrade-readiness-monitor' ); ?>
 			</p>
 
 			<h2><?php esc_html_e( 'Environment', 'upgrade-readiness-monitor' ); ?></h2>
@@ -630,38 +826,33 @@ class D9_Upgrade_Readiness_Monitor {
 						<td><strong><?php esc_html_e( 'PHP version', 'upgrade-readiness-monitor' ); ?></strong></td>
 						<td>
 							<?php echo esc_html( $env['php_current'] ); ?>
-							<?php if ( $env['php_ok'] ) : ?>
-								<span class="d9urm-pill d9urm-green"><?php esc_html_e( 'OK', 'upgrade-readiness-monitor' ); ?></span>
-							<?php else : ?>
-								<span class="d9urm-pill d9urm-amber">
-									<?php
-									/* translators: %s: target PHP version */
-									echo esc_html( sprintf( __( 'Below recommended %s', 'upgrade-readiness-monitor' ), $env['php_target'] ) );
-									?>
-								</span>
-							<?php endif; ?>
+							<span class="d9urm-pill d9urm-<?php echo $env['php_ok'] ? 'green' : 'amber'; ?>">
+								<?php echo $env['php_ok'] ? esc_html__( 'OK', 'upgrade-readiness-monitor' ) : esc_html( sprintf( /* translators: %s: PHP version */ __( 'Below %s', 'upgrade-readiness-monitor' ), $env['php_target'] ) ); ?>
+							</span>
 						</td>
 					</tr>
 					<tr>
 						<td><strong><?php esc_html_e( 'WordPress version', 'upgrade-readiness-monitor' ); ?></strong></td>
 						<td><?php echo esc_html( $env['wp_current'] ); ?></td>
 					</tr>
-					<tr>
-						<td><strong><?php esc_html_e( 'WP_DEBUG', 'upgrade-readiness-monitor' ); ?></strong></td>
-						<td><?php echo $env['wp_debug'] ? esc_html__( 'On', 'upgrade-readiness-monitor' ) : esc_html__( 'Off', 'upgrade-readiness-monitor' ); ?></td>
-					</tr>
 				</tbody>
 			</table>
 
-			<h2 style="margin-top:2em;"><?php esc_html_e( 'Plugin & theme compatibility', 'upgrade-readiness-monitor' ); ?></h2>
+			<h2 style="margin-top:2em;"><?php esc_html_e( 'Plugin compatibility', 'upgrade-readiness-monitor' ); ?></h2>
 			<p>
-				<button type="button" class="button button-primary" id="d9urm-scan"><?php esc_html_e( 'Scan plugins', 'upgrade-readiness-monitor' ); ?></button>
+				<button type="button" class="button button-primary" id="d9urm-scan"><?php esc_html_e( 'Scan plugins now', 'upgrade-readiness-monitor' ); ?></button>
 				<span id="d9urm-scan-status" style="margin-left:10px;"></span>
 			</p>
-			<div id="d9urm-scan-progress" style="display:none;max-width:400px;background:#dcdcde;border-radius:3px;margin:10px 0;overflow:hidden;">
-				<div id="d9urm-scan-bar" style="width:0;background:#2271b1;color:#fff;text-align:center;padding:4px 0;font-size:12px;">0%</div>
-			</div>
-			<table class="widefat striped" id="d9urm-scan-table" style="display:none;">
+			<?php if ( ! empty( $results['completed_at'] ) ) : ?>
+				<p class="description" id="d9urm-last-scan">
+					<?php
+					/* translators: %s: human time diff */
+					echo esc_html( sprintf( __( 'Last scanned %s ago.', 'upgrade-readiness-monitor' ), human_time_diff( $results['completed_at'] ) ) );
+					?>
+				</p>
+			<?php endif; ?>
+
+			<table class="widefat striped" id="d9urm-scan-table" style="<?php echo empty( $results['rows'] ) ? 'display:none;' : ''; ?>">
 				<thead>
 					<tr>
 						<th><?php esc_html_e( 'Plugin', 'upgrade-readiness-monitor' ); ?></th>
@@ -670,16 +861,23 @@ class D9_Upgrade_Readiness_Monitor {
 						<th><?php esc_html_e( 'Notes', 'upgrade-readiness-monitor' ); ?></th>
 					</tr>
 				</thead>
-				<tbody></tbody>
+				<tbody>
+					<?php foreach ( ( $results['rows'] ?? array() ) as $row ) : ?>
+						<tr>
+							<td><?php echo esc_html( $row['name'] ); ?><?php echo $row['active'] ? '' : ' <em>(' . esc_html__( 'inactive', 'upgrade-readiness-monitor' ) . ')</em>'; ?></td>
+							<td><?php echo esc_html( $row['version'] ); ?></td>
+							<td><span class="d9urm-pill d9urm-<?php echo esc_attr( $row['status'] ); ?>"><?php echo esc_html( strtoupper( $row['status'] ) ); ?></span></td>
+							<td><?php echo esc_html( implode( ' · ', $row['reasons'] ) ); ?></td>
+						</tr>
+					<?php endforeach; ?>
+				</tbody>
 			</table>
 
 			<h2 style="margin-top:2em;"><?php esc_html_e( 'Captured deprecation notices', 'upgrade-readiness-monitor' ); ?></h2>
 			<?php if ( empty( $log ) ) : ?>
 				<p id="d9urm-no-deprecations"><?php esc_html_e( 'No deprecation notices captured yet. Keep browsing your site and admin — anything deprecated will show up here.', 'upgrade-readiness-monitor' ); ?></p>
 			<?php else : ?>
-				<p>
-					<button type="button" class="button" id="d9urm-clear"><?php esc_html_e( 'Clear log', 'upgrade-readiness-monitor' ); ?></button>
-				</p>
+				<p><button type="button" class="button" id="d9urm-clear"><?php esc_html_e( 'Clear log', 'upgrade-readiness-monitor' ); ?></button></p>
 				<table class="widefat striped" id="d9urm-deprecations">
 					<thead>
 						<tr>
@@ -713,19 +911,7 @@ class D9_Upgrade_Readiness_Monitor {
 	}
 
 	/**
-	 * Inline CSS for status pills.
-	 *
-	 * @since 1.0.0
-	 *
-	 * @return string
-	 */
-	private function inline_css() {
-		return '.d9urm-pill{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;color:#fff;vertical-align:middle;}'
-			. '.d9urm-green{background:#00a32a;}.d9urm-amber{background:#dba617;}.d9urm-red{background:#d63638;}';
-	}
-
-	/**
-	 * Inline admin JS for the scan + clear actions.
+	 * Inline admin JS: start background scan + poll status + clear log.
 	 *
 	 * @since 1.0.0
 	 *
@@ -737,79 +923,62 @@ class D9_Upgrade_Readiness_Monitor {
 	'use strict';
 	var d = window.d9urmData || {};
 	var i18n = d.i18n || {};
+	var poll = null;
 
 	function esc( s ) { return $( '<div>' ).text( s == null ? '' : s ).html(); }
+	function pill( s ) { return '<span class="d9urm-pill d9urm-' + esc( s ) + '">' + esc( ( s || '' ).toUpperCase() ) + '</span>'; }
 
-	function pill( status ) {
-		return '<span class="d9urm-pill d9urm-' + esc( status ) + '">' + esc( status.toUpperCase() ) + '</span>';
+	function renderRows( rows ) {
+		var $body = $( '#d9urm-scan-table tbody' );
+		$body.empty();
+		( rows || [] ).forEach( function ( row ) {
+			$body.append(
+				'<tr><td>' + esc( row.name ) + ( row.active ? '' : ' <em>(inactive)</em>' ) + '</td>' +
+				'<td>' + esc( row.version ) + '</td>' +
+				'<td>' + pill( row.status ) + '</td>' +
+				'<td>' + esc( ( row.reasons || [] ).join( ' · ' ) ) + '</td></tr>'
+			);
+		} );
+		if ( rows && rows.length ) { $( '#d9urm-scan-table' ).show(); }
+	}
+
+	function setStatus( txt ) { $( '#d9urm-scan-status' ).text( txt || '' ); }
+
+	function startPolling() {
+		if ( poll ) { return; }
+		poll = setInterval( function () {
+			$.post( d.ajaxUrl, { action: 'd9urm_scan_status', nonce: d.nonce } ).done( function ( resp ) {
+				if ( ! resp || ! resp.success ) { return; }
+				var state = resp.data.state || {};
+				var results = resp.data.results || {};
+				if ( state.running ) {
+					var pct = state.total ? Math.round( ( state.offset || 0 ) / state.total * 100 ) : 0;
+					setStatus( i18n.scanning + ' ' + pct + '%' );
+				} else {
+					clearInterval( poll ); poll = null;
+					setStatus( i18n.done );
+					$( '#d9urm-scan' ).prop( 'disabled', false );
+					renderRows( results.rows );
+				}
+			} );
+		}, 2500 );
 	}
 
 	function scan() {
-		var $btn = $( '#d9urm-scan' ), $status = $( '#d9urm-scan-status' );
-		var $progress = $( '#d9urm-scan-progress' ), $bar = $( '#d9urm-scan-bar' );
-		var $table = $( '#d9urm-scan-table' ), $body = $table.find( 'tbody' );
-
-		$btn.prop( 'disabled', true ).text( i18n.scanning );
-		$status.text( '' );
-		$body.empty();
-		$table.hide();
-		$bar.css( 'width', '0%' ).text( '0%' );
-		$progress.show();
-
-		var offset = 0, total = null;
-
-		function step() {
-			$.post( d.ajaxUrl, {
-				action: 'd9urm_scan',
-				nonce: d.nonce,
-				offset: offset,
-				limit: d.batchSize || 5
-			} ).done( function ( resp ) {
-				if ( ! resp || ! resp.success ) {
-					$status.text( i18n.error );
-					finish();
-					return;
-				}
-				var data = resp.data;
-				total = data.total;
-				( data.rows || [] ).forEach( function ( row ) {
-					var notes = ( row.reasons || [] ).map( esc ).join( '<br>' );
-					$body.append(
-						'<tr><td>' + esc( row.name ) + ( row.active ? '' : ' <em>(' + 'inactive' + ')</em>' ) + '</td>' +
-						'<td>' + esc( row.version ) + '</td>' +
-						'<td>' + pill( row.status ) + '</td>' +
-						'<td>' + notes + '</td></tr>'
-					);
-				} );
-				$table.show();
-				offset += ( d.batchSize || 5 );
-				var pct = total ? Math.min( 100, Math.round( offset / total * 100 ) ) : 100;
-				$bar.css( 'width', pct + '%' ).text( pct + '%' );
-				if ( offset < total ) {
-					step();
-				} else {
-					finish();
-				}
-			} ).fail( function () {
-				$status.text( i18n.error );
-				finish();
-			} );
-		}
-
-		function finish() {
-			$progress.hide();
-			$btn.prop( 'disabled', false ).text( i18n.scan );
-		}
-
-		step();
+		$( '#d9urm-scan' ).prop( 'disabled', true );
+		setStatus( i18n.scanning );
+		$.post( d.ajaxUrl, { action: 'd9urm_start_scan', nonce: d.nonce } ).done( function ( resp ) {
+			if ( ! resp || ! resp.success ) { setStatus( i18n.error ); $( '#d9urm-scan' ).prop( 'disabled', false ); return; }
+			startPolling();
+		} ).fail( function () {
+			setStatus( i18n.error ); $( '#d9urm-scan' ).prop( 'disabled', false );
+		} );
 	}
 
 	function clearLog() {
 		if ( ! window.confirm( i18n.confirm ) ) { return; }
 		$.post( d.ajaxUrl, { action: 'd9urm_clear', nonce: d.nonce } ).done( function () {
 			$( '#d9urm-deprecations, #d9urm-clear' ).remove();
-			$( '#d9urm-scan' ).closest( '.wrap' ).find( 'h2' ).last()
-				.after( '<p id="d9urm-no-deprecations">' + esc( i18n.cleared ) + '</p>' );
 		} );
 	}
 
@@ -826,14 +995,17 @@ JS;
 	 * ------------------------------------------------------------------- */
 
 	/**
-	 * Clean up options/transients on uninstall.
+	 * Clean up on uninstall.
 	 *
 	 * @since 1.0.0
 	 */
 	public static function uninstall() {
 		global $wpdb;
 		delete_option( D9URM_LOG_OPTION );
-		// Remove cached wordpress.org lookups.
+		delete_option( D9URM_RESULTS_OPTION );
+		delete_option( D9URM_STATE_OPTION );
+		wp_clear_scheduled_hook( 'd9urm_weekly_scan' );
+		wp_clear_scheduled_hook( 'd9urm_run_scan_chunk' );
 		$wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient_d9urm_org_%' OR option_name LIKE '_transient_timeout_d9urm_org_%'" ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
 	}
 }
@@ -842,7 +1014,7 @@ $d9urm = new D9_Upgrade_Readiness_Monitor();
 $d9urm->init();
 
 /**
- * WP-CLI command: readiness.
+ * WP-CLI command.
  *
  * @since 1.0.0
  */
@@ -885,28 +1057,27 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 			WP_CLI::log( sprintf( 'PHP: %s (target %s) — %s', $env['php_current'], $env['php_target'], $env['php_ok'] ? 'OK' : 'below recommended' ) );
 			WP_CLI::log( sprintf( 'WordPress: %s', $env['wp_current'] ) );
 
-			$audit = D9_Upgrade_Readiness_Monitor::audit_plugins();
-			$rows  = array();
-			foreach ( $audit['rows'] as $row ) {
-				$rows[] = array(
+			$rows  = D9_Upgrade_Readiness_Monitor::audit_all();
+			$table = array();
+			foreach ( $rows as $row ) {
+				$table[] = array(
 					'plugin'  => $row['name'],
 					'version' => $row['version'],
 					'status'  => $row['status'],
 					'notes'   => implode( '; ', $row['reasons'] ),
 				);
 			}
-			if ( ! empty( $rows ) ) {
-				WP_CLI\Utils\format_items( $format, $rows, array( 'plugin', 'version', 'status', 'notes' ) );
+			if ( ! empty( $table ) ) {
+				WP_CLI\Utils\format_items( $format, $table, array( 'plugin', 'version', 'status', 'notes' ) );
 			}
 
 			$log          = get_option( D9URM_LOG_OPTION, array() );
 			$deprecations = is_array( $log ) ? count( $log ) : 0;
 			WP_CLI::log( sprintf( '%d distinct deprecation notice(s) captured so far.', $deprecations ) );
 
-			$verdict = D9_Upgrade_Readiness_Monitor::verdict( $audit['rows'], $deprecations );
+			$verdict = D9_Upgrade_Readiness_Monitor::verdict( $rows, $deprecations );
 			if ( 'red' === $verdict ) {
-				WP_CLI::error( 'Readiness: RED — issues must be resolved before upgrading.', false );
-				WP_CLI::halt( 1 );
+				WP_CLI::error( 'Readiness: RED — issues must be resolved before upgrading.' );
 			} elseif ( 'amber' === $verdict ) {
 				WP_CLI::warning( 'Readiness: AMBER — review the items above before upgrading.' );
 			} else {

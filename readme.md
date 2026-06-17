@@ -1,10 +1,10 @@
 # Upgrade Readiness Monitor
 Contributors: dhanendran
 Tags: deprecation, php compatibility, upgrade, developer, site health
-Requires at least: 5.2
+Requires at least: 5.4
 Tested up to: 7.0
 Requires PHP: 7.4
-Stable tag: 1.0.0
+Stable tag: 1.1.0
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -54,6 +54,12 @@ No. WordPress fires its deprecation hooks whether or not `WP_DEBUG` is enabled, 
 It catches deprecations that actually run, plus header/registry-based compatibility signals. As with any tool, runtime-only issues still warrant testing on staging — but you'll start every upgrade knowing far more than before.
 
 == Changelog ==
+
+= 1.1.0 =
+* [Fix] Resolved a memory-exhaustion risk: the plugin audit now requests only the minimal fields from WordPress.org (no full changelog/sections payloads) via `plugins_api()`.
+* [Improvement] The plugin audit now runs entirely in the background via WP-Cron, in small chunks, so it never blocks or slows a page load — the admin screen polls for progress. A weekly background re-scan keeps results fresh.
+* [Improvement] Deprecation capture is now bounded (frame-limited backtrace, a per-request cap) and only writes to the database when a new deprecation signature appears — no steady-state writes on normal traffic.
+* [Improvement] Added a kill switch: define `D9URM_DISABLE_CAPTURE` (or filter `d9urm_capture_enabled`) to turn capture off.
 
 = 1.0.0 =
 * Initial release: real-time deprecation capture, plugin/theme compatibility audit with a readiness verdict, and a `wp readiness check` WP-CLI command.
